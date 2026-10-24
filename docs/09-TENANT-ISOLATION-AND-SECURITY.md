@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Draft; D5 and D18 approved 2026-10-23 and incorporated; D7, D8, D10, D13, D14, D24 open |
+| **Status** | Draft; D5 and D18 approved 2026-10-23 and D24 (staging placement) approved 2026-10-24, incorporated; D7, D8, D10, D13, D14 and the D24 drill placement open |
 | **Date** | 2026-10-23 |
 | **Related** | [05 Data Model](05-DATA-MODEL.md) · [08 RBAC](08-RBAC-MATRIX.md) · [07 Tests](07-TEST-AND-ACCEPTANCE-PLAN.md) |
 
@@ -141,7 +141,7 @@ CREATE POLICY tenant_isolation ON transactions
 | Backup `age` identity (private) | **Offline** (password manager plus a paper copy). Never on the VPS | Yearly re-key |
 | Object-storage credentials | rclone config secret; write-only (no delete) where the provider supports it | 180 days |
 
-Files live in `deploy/secrets/` (git-ignored, mode 0400, owned by root) and are mounted at `/run/secrets/*`. Config loads secrets from `*_FILE` paths only.
+Files live in `deploy/secrets/<env>/` (git-ignored, owned by `root:<env group>`, mode **0440**, directory 0750) and are mounted at `/run/secrets/*`. Compose file secrets are bind mounts that keep host ownership and mode (`uid`/`gid`/`mode` are ignored for file secrets), so a root-only 0400 file would be unreadable by the non-root container user; each environment's containers instead run with a dedicated gid (staging: 2999, group `finbot-staging`) that no host user belongs to. Never reuse the image's default uid 999 for ownership (on the current VPS it is the `caddy` user). Secret files are created by root; the development user `claude` neither reads them nor has Docker access, and `deploy` (Docker operator) is the only non-root account that can reach them, through Docker (doc 04 §8.3). Config loads secrets from `*_FILE` paths only.
 
 ## 8. Break-glass support access
 

@@ -2,10 +2,10 @@
 
 Guidance for Claude Code (and humans) working in this repository.
 
-## Project state (as of 2026-10-23)
+## Project state (as of 2026-10-24)
 
 - **V1 (legacy, in production):** `main.py`, a single-file python-telegram-bot app with Google Sheets as storage. Known issues are catalogued in `PROJECT_AUDIT.md`.
-- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Steps 1 (decision reconciliation) and 2 (package skeleton, config, testing foundation; doc 06 §6) are done; Step 3 (database foundation) awaits owner review. **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB), **D23** (Python 3.13 + uv). Its full specification is in `docs/` (read these before any V2 work):
+- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Steps 1 (decision reconciliation) and 2 (package skeleton, config, testing foundation; doc 06 §6) are done; Step 3A (infrastructure audit, staging PostgreSQL design in `deploy/staging/`) is accepted as a configuration baseline; **runtime deployment of staging is not yet approved** (nothing pulled or started). Step 3B (Alembic baseline + RLS) has not started. **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB), **D23** (Python 3.13 + uv); **2026-10-24: D24** (staging runs on the existing Contabo VPS, isolated by compose project, network, volume and secrets; drill placement still open). Its full specification is in `docs/` (read these before any V2 work):
 
 | Doc | Read when |
 |---|---|
@@ -69,7 +69,7 @@ Configuration: only `FINBOT_*` environment variables are read, and no `.env` fil
 
 Logging: use `logging.getLogger(__name__)` and pass only allow-listed `extra=` fields (`finbot.logging.ALLOWED_EXTRA_FIELDS`). String `%s` arguments are redacted unless wrapped in `finbot.logging.safe(...)`.
 
-Planned for later steps: `docker compose -f deploy/compose.staging.yml up -d` (Step 5).
+Staging (runbook `deploy/staging/README.md`; always pass `-f`, never bare `docker compose` at the repo root, which is V1): `make staging-config` validates offline. Never `down -v` or `docker volume prune` on the VPS.
 
 V1: `python main.py` (needs `.env`) or `docker compose up -d` (root `docker-compose.yml`).
 
@@ -84,6 +84,7 @@ V1: `python main.py` (needs `.env`) or `docker compose up -d` (root `docker-comp
 
 ## Working agreements
 
+- Host roles (D24): `claude` is the development user and has **no Docker access**. Never request it or work around it (no sudo, no socket tricks). `deploy` is the only Docker operator; root prepares host groups and secrets. Write proposed `docker`/`sudo` commands for the owner to run instead of executing them. Never touch the unrelated `services` stack (`services-postgres`, `services-redis`, `services_default`).
 - Git: the integration branch is `develop`; `main` is production. Do not commit, push, deploy or install dependencies unless the user asks in the current conversation.
 - When a task changes behavior covered by an FR, NFR or RBAC row, update the corresponding doc in the same change.
 - Any isolation or authorization defect is Sev-1: report it immediately and do not work around it.

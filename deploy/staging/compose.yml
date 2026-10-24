@@ -1,0 +1,175 @@
+# Telegram-Finance-Bot V2: STAGING compose project (D18). Runbook: deploy/staging/README.md
+#
+# Phase 1 Step 3A: the PostgreSQL service only. The migrate, bot and backup services are added
+# in later steps (doc 04 §8.1). Isolation from V1 and from the future production project:
+#   project  finbot-staging            (V1: directory-named project, container "finance-bot")
+#   volume   finbot-staging_pgdata     (V1: "<project>_bot-data"; production: finbot-prod_pgdata)
+#   network  finbot-staging_db         (internal + gateway mode "isolated": no egress, no route
+#                                       to or from the host, never shared; 172.31.250.0/27)
+#   database finbot_staging            (guard G-ENV-2; production: finbot_prod)
+#
+# Rules enforced by tests/deploy/test_staging_compose.py (AT-DEP-01):
+#   * postgres has NO `ports:` / `expose:` and joins only the db network, so it is reachable
+#     only from containers on that network: never from the host, other projects or the internet.
+#     Future application containers (bot) join `db` AND a separate egress network for
+#     Telegram/Gemini; postgres never joins the egress network (doc 04 §8.1).
+#   * the image is pinned by version AND digest; a change is a reviewed PR (doc 04 §8.2).
+#   * secrets come only from git-ignored files in deploy/secrets/staging/ (no inline values,
+#     no variable interpolation, no .env file).
+
+name: finbot-staging
+
+services:
+  postgres:
+    # PostgreSQL 18.6 (released 2026-08-13; 18.5 was never released), Debian 13 "trixie".
+    # Digest = multi-arch image index of the tag, verified against registry-1.docker.io on
+    # 2026-10-24 (amd64 manifest sha256:9770878138a2e83abcb10856d30cc3f24dae0d317bb956db6ab9159de6c3c80d).
+    image: postgres:18.6-trixie@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
+    container_name: finbot-staging-postgres
+    # Dedicated uid/gid that exist nowhere else on the host. The image's default uid 999 is the
+    # host's "caddy" user on this VPS, and secret files are bind mounts that keep host ownership:
+    # they are root:2999 mode 0440, readable only by this container (see README "Secrets").
+    user: "2999:2999"
+    restart: unless-stopped
+    stop_signal: SIGINT # PostgreSQL "fast" shutdown (image default, kept explicit)
+    stop_grace_period: 60s
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_DB: postgres # finbot_staging is created by 00-roles.sh, owned by finbot_owner
+      POSTGRES_PASSWORD_FILE: /run/secrets/db_superuser_password
+      # Data checksums are the PG 18 default; passed explicitly so a default change cannot
+      # silently drop them. The builtin C.UTF-8 collation avoids glibc collation changes across
+      # base-image updates (index corruption risk); --locale sets the remaining libc categories
+      # to C.UTF-8 too instead of the image's LANG=en_US.utf8. Fixed at initdb time.
+      POSTGRES_INITDB_ARGS: >-
+        --auth-host=scram-sha-256 --auth-local=scram-sha-256 --data-checksums
+        --encoding=UTF8 --locale=C.UTF-8 --locale-provider=builtin --builtin-locale=C.UTF-8
+      # Explicit so that a future change of the image default cannot point the server at a new,
+      # empty cluster. PG 18 layout: the volume is mounted at /var/lib/postgresql (not .../data).
+      PGDATA: /var/lib/postgresql/18/docker
+      FINBOT_ENV: staging
+      FINBOT_DB_NAME: finbot_staging
+      # Written by 00-roles.sh after a fully verified initialisation; the healthcheck requires
+      # it, so a half-initialised cluster (script failed, container restarted) is never healthy.
+      FINBOT_INIT_MARKER: /var/lib/postgresql/18/finbot-init.done
+      PSQL_HISTORY: /dev/null # break-glass psql sessions never persist query history
+    command:
+      - postgres
+      - -c
+      - hba_file=/etc/postgresql/pg_hba.conf
+      - -c
+      - password_encryption=scram-sha-256
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - max_connections=30
+      - -c
+      - timezone=UTC
+      - -c
+      - log_timezone=UTC
+      - -c
+      - log_min_duration_statement=500ms
+      # The default (-1) would log bind parameters (user data, amounts) in full: NFR-PRV-01.
+      - -c
+      - log_parameter_max_length=0
+      - -c
+      - log_parameter_max_length_on_error=0
+      - -c
+      - log_connections=authentication,authorization # no "receipt": healthchecks would flood logs
+      - -c
+      - log_disconnections=on
+      # Logs DDL text. ALTER ROLE ... PASSWORD must run with `SET log_statement = 'none'`
+      # (README "Password rotation"); 00-roles.sh does this itself.
+      - -c
+      - log_statement=ddl
+    healthcheck:
+      # Healthy only when initialisation completed (marker) AND the real server accepts TCP: the
+      # init-time server listens on no TCP address. pg_isready needs no password and stops at
+      # the authentication request, which PostgreSQL does not log.
+      test:
+        - CMD-SHELL
+        - test -f /var/lib/postgresql/18/finbot-init.done && pg_isready -h 127.0.0.1 -p 5432 -d finbot_staging -U postgres
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 30s
+      start_interval: 2s
+    volumes:
+      - type: volume
+        source: pgdata
+        target: /var/lib/postgresql
+      - type: bind
+        source: ../postgres/initdb
+        target: /docker-entrypoint-initdb.d
+        read_only: true
+      - type: bind
+        source: ./postgres/pg_hba.conf
+        target: /etc/postgresql/pg_hba.conf
+        read_only: true
+    secrets:
+      - db_superuser_password
+      - db_owner_password
+      - db_app_password
+      - db_backup_password
+    networks:
+      - db
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /var/run/postgresql:size=1m,mode=1777
+    shm_size: 128m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "1.0"
+          memory: 512M
+          pids: 256
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    labels:
+      org.finbot.environment: staging
+      org.finbot.component: postgres
+
+networks:
+  db:
+    name: finbot-staging_db
+    driver: bridge
+    # internal: no default route, traffic to/from other networks dropped. On its own, Docker
+    # still gives the bridge a host address, so host processes could reach container IPs and
+    # containers could reach host services on 0.0.0.0. Gateway mode "isolated" (internal
+    # networks only) assigns no bridge address, removing both paths.
+    internal: true
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.gateway_mode_ipv4: isolated
+    ipam:
+      config:
+        # Fixed so pg_hba.conf can name it exactly. Not in use on the VPS (2026-10-24: only
+        # 172.17.0.0/16 and 172.18.0.0/16); Docker refuses to create overlapping networks.
+        - subnet: 172.31.250.0/27
+    labels:
+      org.finbot.environment: staging
+
+volumes:
+  pgdata:
+    name: finbot-staging_pgdata
+    labels:
+      org.finbot.environment: staging
+
+secrets:
+  # Git-ignored files (deploy/secrets/), created on the host per README; never printed.
+  db_superuser_password:
+    file: ../secrets/staging/db_superuser_password
+  db_owner_password:
+    file: ../secrets/staging/db_owner_password
+  db_app_password:
+    file: ../secrets/staging/db_app_password
+  db_backup_password:
+    file: ../secrets/staging/db_backup_password

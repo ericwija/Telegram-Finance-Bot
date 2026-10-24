@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Approved in part: D1, D5, D9, D11 and D18 approved 2026-10-23; other decisions open (§8) |
+| **Status** | Approved in part: D1, D5, D9, D11, D18 and D23 approved 2026-10-23; D24 (staging placement) approved 2026-10-24; other decisions open (§8) |
 | **Date** | 2026-10-23 (rev. 2: Phase 1 Step 1) |
 | **Supersedes** | V1 single-file bot (`main.py`, Google Sheets storage) |
 | **Inputs** | `PROJECT_AUDIT.md`, `README.md`, the approved product vision brief |
@@ -137,7 +137,7 @@ Each document cites these decisions by ID. **Status** is either ✅ *Approved* (
 | **D21** | ⏳ Open (new) | Can a transaction's **type** be changed after it is posted? | (a) type is immutable; "change type" voids the original and creates a linked replacement; (b) mutable type | **(a)**: the type is part of the entry sign rules and FKs (doc 05 §5.2). The UI still offers "ubah jenis", implemented as void + replace in one DB transaction | 02, 05, 08 |
 | **D22** | ⏳ Open (new) | Sign and terminology for entries | (a) signed `amount` (outflow < 0, inflow > 0) with leg names `source`/`destination`/`single`; (b) separate debit/credit columns | **(a)**. The owner's D1 wording "debit from the source, credit to the destination" maps to *source leg negative, destination leg positive*. We avoid the words debit/credit in code because classical double-entry uses the opposite sign for asset accounts | 05 |
 | **D23** | ⏳ Open (new; **blocks Step 2**) | Python version and dependency tooling | Python 3.12 / 3.13 / 3.14; `uv` (uv.lock) vs pip-tools (hashed requirements) | **Python 3.13** + **uv** with a committed `uv.lock`; image builds use `uv sync --frozen` | 03, 04, 06 |
-| **D24** | ⏳ Open (new; needed before Phase 1 exit) | Where staging runs, and where backup drills and migration rehearsals run | (a) staging on the production VPS as a separate compose project; (b) a separate staging VPS. Drills and rehearsals: (i) in staging; (ii) in a separate ephemeral "drill" environment | **(b)** if budget allows, else (a). **(ii)** for drills and rehearsals, because staging must never hold production personal data (doc 09 §9) | 04, 06, 09 |
+| **D24** | ✅ Approved 2026-10-24 (staging placement); drill placement ⏳ open | Where staging runs, and where backup drills and migration rehearsals run | (a) staging on an existing VPS as a separate compose project; (b) a separate staging VPS. Drills and rehearsals: (i) in staging; (ii) in a separate ephemeral "drill" environment | **Approved: staging runs on the existing Contabo VPS**, isolated from everything else on it by its own Docker compose project (`finbot-staging`), internal network (`finbot-staging_db`, gateway mode isolated), volume (`finbot-staging_pgdata`) and secrets (`deploy/secrets/staging/`). The VPS also hosts an unrelated `services` stack (`services-postgres`, `services-redis`, network `services_default`), which V2 never touches. **Operators:** `claude` is the development user and has **no Docker access**; `deploy` is the Docker operator; root (sudo) prepares host groups and secret files (doc 04 §8.3). Drills and rehearsals: recommended default **(ii)**, because staging must never hold production personal data (doc 09 §9); not yet approved | 04, 06, 09 |
 | **D25** | ⏳ Open (new; non-blocking) | CI platform | GitHub Actions vs other | **GitHub Actions** (the README and remote suggest GitHub) | 06 |
 
 ## 9. Glossary

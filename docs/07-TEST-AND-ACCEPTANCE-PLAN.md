@@ -11,7 +11,7 @@
 | Level | Scope | Tooling | Runs |
 |---|---|---|---|
 | **Unit** | `domain/` (money, parsers, date resolution), `authz/policy`, rendering, callback codec | pytest, hypothesis | Every push |
-| **Integration** | Services + repositories against **real PostgreSQL 18**, using the same pinned image digest as `deploy/compose.base.yml`, with migrations applied; RLS; constraints | pytest-asyncio, testcontainers | Every push (needs Docker; marked `@pytest.mark.db`, skipped locally if Docker is absent, never skipped in CI) |
+| **Integration** | Services + repositories against **real PostgreSQL 18**, using the same pinned image digest as `deploy/staging/compose.yml`, with migrations applied; RLS; constraints | pytest-asyncio, testcontainers | Every push (needs Docker; marked `@pytest.mark.db`, skipped locally if Docker is absent, never skipped in CI) |
 | **Authorization** | Matrix and rule tests through the **service layer** (§3) | Generated parametrized tests | Every push |
 | **Adapter** | Telegram handlers with synthetic `Update` objects and a fake Bot (records outgoing calls) | PTB test utilities | Every push |
 | **AI contract** | Prompt → schema-validated output, using **recorded** Gemini responses; no network in CI | Fixtures + schema | Every push |
@@ -189,7 +189,7 @@ All run as `finbot_app` against PostgreSQL 18 at **both** the service level and 
 | AT-TXN-REV-01 | Revisions | create → update → delete → restore gives 4 revisions with correct `changed_fields` |
 | AT-BAL-PROP-01 | Balances | Hypothesis state machine over create, edit, void, restore and type change; for every state, Σ account balances = Σ opening + Σ posted income − Σ posted expense, and Σ current transfer entries = 0 (INV-7) |
 | AT-ENV-01..06 | Environment guards | Each guard G-ENV-1…6 (doc 04 §8.3) blocks startup when violated; e.g. staging config + a DB marked `production` → exit code ≠ 0 with a guard log line |
-| AT-DEP-01 | Compose lint | `compose.staging.yml` and `compose.prod.yml` (rendered with `docker compose config`) have no `ports` on `postgres`; the image is pinned by digest; healthchecks are present; the `db` network is internal |
+| AT-DEP-01 | Compose lint (`tests/deploy/test_staging_compose.py`) | `deploy/staging/compose.yml` (later `deploy/prod/compose.yml`), raw and rendered with `docker compose config`, has no `ports`/`expose` on `postgres`; the image is pinned by version and digest; healthchecks are present; the `db` network is internal; secrets only from git-ignored files; no V1/production names; non-root dedicated uid, read-only FS, `cap_drop: ALL`; `log_parameter_max_length=0`; `pg_hba.conf` has no weak methods; the init script never grants privileges to `finbot_app` or logs passwords |
 | AT-CFG-01..05 | Configuration | Missing required settings → a validation error naming the field; inline secrets rejected in staging/production; `*_FILE` secrets loaded and masked in `repr`; unknown `FINBOT_ENV` rejected; no I/O at import |
 | AT-RPT-01 | Reports | Fixture results equal an independent Python reference implementation |
 | AT-RENDER-01 | Rendering | Descriptions containing `<b>`, `&`, `*`, `_`, `[x](y)` render literally; no Telegram parse error |

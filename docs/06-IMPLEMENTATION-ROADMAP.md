@@ -53,9 +53,9 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 |---|---|---|
 | **1. Decision reconciliation** (this revision) | Docs updated for D1, D5, D9, D11 and D18; blockers listed; Step 2 checklist (§6) | Owner approves the docs and D23 |
 | **2. Package skeleton, configuration, testing foundation** | `pyproject.toml`, `uv.lock`, `src/finbot` layer packages (empty but importable), `config.py` (typed, `*_FILE` secrets, env guards that need no I/O), `logging.py` (JSON + redaction), test tree, ruff, mypy, import-linter, pytest config, `finbot check-config` CLI. **No DB, no Docker, no Telegram.** Checklist: §6 | AC-P1-01, AC-P1-05, AC-P1-06 |
-| **3. Database foundation** | `deploy/compose.base.yml` + `compose.dev.yml` with **pinned PostgreSQL 18** (doc 04 §8.2); `initdb` roles script; Alembic env (owner role); baseline revision per doc 05 §11 (P1 row) with RLS ENABLE + FORCE and policies; testcontainers fixture using the same image digest | AC-P1-02, AC-P1-03 |
+| **3. Database foundation** | **3A** (infrastructure audit and staging design): `deploy/staging/compose.yml` with **pinned PostgreSQL 18** (doc 04 §8.2), `pg_hba.conf`, `deploy/postgres/initdb/00-roles.sh`, runbook, AT-DEP-01 static tests; nothing started. **3B onward:** `compose.dev.yml`; Alembic env (owner role); baseline revision per doc 05 §11 (P1 row) with RLS ENABLE + FORCE and policies; testcontainers fixture using the same image digest | AC-P1-02, AC-P1-03 |
 | **4. Runtime plumbing** | Async engine (app role); UoW with transaction-local `set_config`; guards G-ENV-2…G-ENV-6 at startup; advisory-lock poller guard; minimal PTB app answering `/start` with "V2 staging"; heartbeat healthcheck | AC-P1-04, AC-P1-07 |
-| **5. CI and staging bring-up** | CI workflow (D25): lint, type, unit + db tests, gitleaks, pip-audit, image build, Trivy, AT-DEP-01; `deploy/compose.staging.yml`; staging secrets layout; staging bring-up on the D24 host with the **staging bot token** | AC-P1-02 (on the VM), AC-P1-08 |
+| **5. CI and staging bring-up** | CI workflow (D25): lint, type, unit + db tests, gitleaks, pip-audit, image build, Trivy, AT-DEP-01; `migrate`/`bot` services added to `deploy/staging/compose.yml`; staging bring-up on the existing Contabo VPS (D24 ✅) by the `deploy` operator, with the **staging bot token** | AC-P1-02 (on the VM), AC-P1-08 |
 
 | Criterion | Requirement |
 |---|---|
@@ -70,7 +70,7 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | **Rollback** | No production impact. Staging: `docker compose -p finbot-staging down -v` and re-create. Steps 2–4 are code-only: revert the branch. **V1 is never touched.** |
 | **Approved inputs** | D5, D9, D18 (approved 2026-10-23); D1 and D11 approved (affect later phases). |
 | **Needs before Step 2** | **D23** (Python version and uv). |
-| **Needs before Step 5 / Phase 1 exit** | **D24** (staging host; drill environment), **D25** (CI platform), a staging bot created via BotFather by the owner. |
+| **Needs before Step 5 / Phase 1 exit** | **D24** drill environment (staging host ✅ approved 2026-10-24), **D25** (CI platform), a staging bot created via BotFather by the owner. |
 
 ---
 
@@ -223,8 +223,8 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | Gate | Decisions required | Status |
 |---|---|---|
 | Start P1 | D5, D9, D18 | ✅ approved 2026-10-23 |
-| P1 Step 2 | **D23** | ⏳ open: **blocking** |
-| P1 Step 5 / exit | D24, D25; staging bot created | ⏳ open |
+| P1 Step 2 | **D23** | ✅ approved 2026-10-23 |
+| P1 Step 5 / exit | D24 drill placement (staging placement ✅ 2026-10-24), D25; staging bot created | ⏳ open |
 | Start P2 | D3, D6, D13, D19, D20 | ⏳ open |
 | Start P3 | D2, D15, D17, D21, D22, O-1 (D1 ✅) | ⏳ open |
 | Start P4 | D7, D8 | ⏳ open |

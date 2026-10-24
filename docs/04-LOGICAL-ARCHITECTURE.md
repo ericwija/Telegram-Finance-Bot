@@ -101,12 +101,12 @@ src/finbot/
 migrations/                     # Alembic (owner role)
 tests/                          # unit / integration / authz / e2e (doc 07)
 deploy/
-├── compose.base.yml            # shared service definitions (pinned postgres:18 image, healthchecks)
+├── staging/compose.yml         # project finbot-staging (P1 Step 3A: postgres only) + README runbook
+├── staging/postgres/pg_hba.conf# staging client authentication (mounted read-only)
 ├── compose.dev.yml             # local only: 127.0.0.1 port binding, never on a VPS
-├── compose.staging.yml         # project finbot-staging
-├── compose.prod.yml            # project finbot-prod (Phase 7)
-├── postgres/initdb/00-roles.sh # login roles from secrets (empty volume only)
-├── secrets/{staging,prod}/     # git-ignored, 0400
+├── prod/compose.yml            # project finbot-prod (Phase 7); shared parts factored out then
+├── postgres/initdb/00-roles.sh # login roles from secrets (empty volume only; all environments)
+├── secrets/{staging,prod}/     # git-ignored; root:<env gid> 0440 (doc 09 §7)
 ├── backup/                     # dump/encrypt/upload scripts
 └── runbooks/                   # restore, cutover, break-glass, minor-upgrade
 ```
@@ -259,7 +259,7 @@ An Admin opens a transaction detail, which shows a 🗑️ button. The Owner the
 ```
 Ubuntu 24.04 LTS VPS  (ufw: allow 22/tcp key-only; deny all other inbound)
 ├── V1 (unchanged until cutover): root docker-compose.yml, container "finance-bot"
-├── docker compose project "finbot-staging"   (D18; host placement per D24)
+├── docker compose project "finbot-staging"   (D18; D24 ✅: the existing Contabo VPS)
 │     postgres · migrate · bot · backup        volumes: finbot-staging_pgdata
 └── docker compose project "finbot-prod"      (created in Phase 7)
       postgres · migrate · bot · backup        volumes: finbot-prod_pgdata
@@ -269,29 +269,30 @@ Within each project:
     ├── migrate   (one-shot: alembic upgrade head, as finbot_owner)
     ├── bot       (as finbot_app; depends_on postgres healthy + migrate completed_successfully)
     └── backup    (pg_dump → age → rclone, as finbot_backup)
-networks: db (internal: true; no egress) + egress (bot: Telegram, Gemini; backup: object storage)
+networks: db (internal: true + gateway mode isolated; no egress, no host path; fixed subnet)
+        + egress (bot: Telegram, Gemini; backup: object storage). postgres joins db ONLY.
 ```
 
 ### 8.2 PostgreSQL 18 container specification (D9, approved)
 
 | Aspect | Specification |
 |---|---|
-| **Image** | Official `postgres` image, **PostgreSQL 18**, Debian variant, pinned as `postgres:18.<minor>-<debian-codename>@sha256:<digest>`. The exact minor version and digest are chosen in P1 Step 3 from the then-current Docker Official Image and recorded in `deploy/compose.base.yml`. **Never** `latest`, `18` or an unpinned tag. Minor updates go through a reviewed PR (Renovate or Dependabot), are applied after a fresh backup, and are noted in the changelog. A major upgrade (19+) needs a separate written plan (dump/restore or `pg_upgrade`); it never happens by changing the tag. |
-| **Persistent storage** | A named volume per environment (`finbot-<env>_pgdata`). **Verify in Step 3:** starting with PostgreSQL 18, the official image changed its default data layout (`PGDATA` under a version-specific directory beneath `/var/lib/postgresql`). The volume must be mounted where the pinned image's documentation says, and `PGDATA` set explicitly in compose so a future image default change cannot silently create a new, empty cluster. Bind mounts to arbitrary host paths are not used. |
-| **No public port** | The `postgres` service has **no `ports:` key** in the staging or production compose files. It is attached only to the `db` network (`internal: true`). A CI check (AT-DEP-01) fails if `ports:` appears under `postgres` in `compose.staging.yml` or `compose.prod.yml`. Developer machines may use `compose.dev.yml`, which binds `127.0.0.1:55432` only, and that file is never used on a VPS. |
-| **Healthcheck** | `pg_isready -h 127.0.0.1 -p 5432 -d finbot_<env> -U postgres`; interval 10 s, timeout 5 s, retries 6, start_period 30 s. `migrate` runs `depends_on: postgres: condition: service_healthy`; `bot` runs `depends_on: migrate: condition: service_completed_successfully`. The bot also has its own healthcheck: a heartbeat file updated by a job tick and checked by `finbot healthcheck`. |
-| **Authentication** | `POSTGRES_PASSWORD_FILE=/run/secrets/db_superuser_password`; `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256`; `password_encryption=scram-sha-256`. The superuser is used only by the init script and break-glass. |
-| **Initialization** | `/docker-entrypoint-initdb.d/00-roles.sh` (runs only on an empty volume) creates the login roles `finbot_owner`, `finbot_app` and `finbot_backup`, with passwords read from Docker secrets, plus `finbot_readonly NOLOGIN`, and the database `finbot_<env>` owned by `finbot_owner`. **All grants, RLS and schema** are created by Alembic as `finbot_owner`, not by the init script. |
+| **Image** | Official `postgres` image, **PostgreSQL 18**, Debian variant, pinned as `postgres:18.<minor>-<debian-codename>@sha256:<digest>`. **Chosen in P1 Step 3A (2026-10-24): `postgres:18.6-trixie@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6`** (multi-arch index digest; 18.6 released 2026-08-13, 18.5 was never released), recorded in `deploy/staging/compose.yml`. **Never** `latest`, `18` or an unpinned tag. Minor updates go through a reviewed PR (Renovate or Dependabot), are applied after a fresh backup, and are noted in the changelog. A major upgrade (19+) needs a separate written plan (dump/restore or `pg_upgrade`); it never happens by changing the tag. |
+| **Persistent storage** | A named volume per environment (`finbot-<env>_pgdata`). **Verified in Step 3A** from the pinned image's config and Dockerfile: `VOLUME /var/lib/postgresql` and `PGDATA=/var/lib/postgresql/18/docker` (the pre-18 `/var/lib/postgresql/data` mount is detected by the entrypoint and refused). The volume is mounted at `/var/lib/postgresql`, and `PGDATA` is set explicitly in compose so a future image default change cannot silently create a new, empty cluster. Bind mounts to arbitrary host paths are not used. |
+| **No public port** | The `postgres` service has **no `ports:` key** in the staging or production compose files. It is attached only to the `db` network: `internal: true` **and** `com.docker.network.bridge.gateway_mode_ipv4: isolated`, with a fixed subnet (staging `172.31.250.0/27`). `internal` alone still gives the bridge a host address, so host processes could reach container IPs and containers could reach host services on `0.0.0.0` (Docker documentation); `isolated` assigns no bridge address. `pg_hba.conf` names this subnet explicitly (no `samenet`) and rejects its gateway address. Application containers that need the internet (bot: Telegram, Gemini; backup: object storage) join `db` **and** a separate, non-internal `egress` network; postgres never joins `egress`. A check (AT-DEP-01, `tests/deploy/`) fails if `ports:` appears under `postgres` in `deploy/staging/compose.yml` (later also `deploy/prod/compose.yml`). Developer machines may use `compose.dev.yml`, which binds `127.0.0.1:55432` only, and that file is never used on a VPS. |
+| **Healthcheck** | `test -f /var/lib/postgresql/18/finbot-init.done && pg_isready -h 127.0.0.1 -p 5432 -d finbot_<env> -U postgres` (the marker is written by `00-roles.sh` only after a verified initialisation, so a half-initialised cluster is never healthy); interval 10 s, timeout 5 s, retries 6, start_period 30 s. `migrate` runs `depends_on: postgres: condition: service_healthy`; `bot` runs `depends_on: migrate: condition: service_completed_successfully`. The bot also has its own healthcheck: a heartbeat file updated by a job tick and checked by `finbot healthcheck`. |
+| **Authentication** | `POSTGRES_PASSWORD_FILE=/run/secrets/db_superuser_password`; `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256`; `password_encryption=scram-sha-256`. A version-controlled `pg_hba.conf` (`-c hba_file=…`, read-only mount) replaces the image's catch-all: the superuser only inside the container (socket or 127.0.0.1, password required), application roles only to `finbot_<env>` from the db network's explicit subnet or in-container loopback, the subnet's gateway address and everything else `reject`. The superuser is used only by the init script and break-glass. |
+| **Initialization** | `/docker-entrypoint-initdb.d/00-roles.sh` (`deploy/postgres/initdb/00-roles.sh`, executable, runs only on an empty volume, with statement logging disabled for its session; idempotent, so an operator can re-run it via `docker exec` to repair a failed first initialisation) creates (if missing) and then enforces the login roles `finbot_owner`, `finbot_app` and `finbot_backup`, with passwords read from Docker secrets, plus `finbot_readonly NOLOGIN`, and the database `finbot_<env>` owned by `finbot_owner`. **All grants, RLS and schema** are created by Alembic as `finbot_owner`, not by the init script. |
 | **Environment marker** | The first Alembic revision creates `platform_meta(key text primary key, value text)` and inserts `('environment', '<env>')` from migration config. The bot refuses to start if the marker differs from `FINBOT_ENV` (guard G-ENV-3, §8.3). |
-| **Server settings** | Passed through `command: -c ...` and kept in version control: `shared_buffers=256MB`, `max_connections=50`, `log_min_duration_statement=500ms`, `log_connections=on`, `log_disconnections=on`, `log_statement=ddl`. Statement logging does not include parameters (PII). Data checksums: enabled. **Verify in Step 3** that PG 18 `initdb` enables them by default; otherwise pass `--data-checksums` in `POSTGRES_INITDB_ARGS`. |
-| **Resources** | `mem_limit: 1g` on a 4 GB VPS (staging: 512 MB), `shm_size: 256m`, `restart: unless-stopped`, `stop_grace_period: 60s`. |
-| **Hardening** | `security_opt: [no-new-privileges:true]`; no Docker socket mounts; the volume is never shared with other services; the `backup` service connects over the `db` network, not by sharing the volume. |
+| **Server settings** | Passed through `command: -c ...` and kept in version control: `shared_buffers=256MB` (staging: 128MB), `max_connections=50` (staging: 30), `log_min_duration_statement=500ms`, `log_connections=authentication,authorization` (PG 18 list syntax; `receipt` omitted so healthchecks do not flood the log), `log_disconnections=on`, `log_statement=ddl`, `timezone=UTC`. **`log_parameter_max_length=0` and `log_parameter_max_length_on_error=0` are mandatory**: the PG default (-1) logs bind parameters (user data) in full with slow statements (NFR-PRV-01). Because `log_statement=ddl` logs DDL text, password changes run with `SET log_statement='none'`. Data checksums: **verified** to be the PG 18 `initdb` default; `--data-checksums` is still passed explicitly. Locale: `--encoding=UTF8 --locale-provider=builtin --builtin-locale=C.UTF-8` (immune to glibc collation changes between base images; fixed at initdb). |
+| **Resources** | memory limit 1 GiB in production (staging: 512 MiB), 1 CPU, 256 PIDs, `shm_size: 256m` (staging: 128m), `restart: unless-stopped`, `stop_grace_period: 60s`; json-file logs capped (10 MiB × 5) because the host daemon has no default rotation. |
+| **Hardening** | runs as a dedicated uid:gid that exists nowhere else on the host (staging `2999:2999`; the image default 999 collides with host system users), `read_only: true` with tmpfs for `/tmp` and `/var/run/postgresql`, `cap_drop: [ALL]`, `security_opt: [no-new-privileges:true]`; no Docker socket mounts; the volume is never shared with other services; the `backup` service connects over the `db` network, not by sharing the volume. |
 
 ### 8.3 Staging isolation (D18, approved)
 
 | Aspect | Staging | Production |
 |---|---|---|
-| Compose project / file | `finbot-staging` / `deploy/compose.staging.yml` (extends `compose.base.yml`) | `finbot-prod` / `deploy/compose.prod.yml` |
+| Compose project / file | `finbot-staging` / `deploy/staging/compose.yml` | `finbot-prod` / `deploy/prod/compose.yml` (Phase 7) |
 | Telegram bot | **Separate bot**, e.g. `@<name>_staging_bot`, with its own token | The production bot (V1's token after cutover C-6, or a new one) |
 | PostgreSQL | Separate container, volume, database `finbot_staging`, and distinct role passwords | Database `finbot_prod` |
 | Networks | Compose-scoped networks (`finbot-staging_db`); never shared | `finbot-prod_db` |
@@ -311,5 +312,7 @@ networks: db (internal: true; no egress) + egress (bot: Telegram, Gemini; backup
 | G-ENV-4 | Telegram `getMe().username` = `TELEGRAM_EXPECTED_BOT_USERNAME`. This stops the production token from being used with the staging config, or the reverse |
 | G-ENV-5 | In `production` and `staging`, every secret comes from a `*_FILE` path. Inline secret environment variables are rejected |
 | G-ENV-6 | Single-poller advisory lock acquired (NFR-AVL-06) |
+
+**Host and operators (D24, approved 2026-10-24):** staging runs on the existing Contabo VPS next to an unrelated `services` stack (`services-postgres` and `services-redis`, both published on 127.0.0.1 only; network `services_default`; volumes `services_*`). No V2 name, port, network or subnet overlaps with it, and V2 never attaches to `services_default`. Roles on the host: **`claude`** is the development user (repository, tests, static checks) and has **no Docker access**, by owner decision; **`deploy`** is the only Docker operator (pull, up, down, logs, exec); **root (sudo)** creates the `finbot-staging` group (gid 2999) and the secret files. Membership of the `docker` group is root-equivalent, so it stays limited to `deploy`.
 
 **Coexistence with V1:** V1 keeps its root `docker-compose.yml`, container name `finance-bot` and token. V2 compose projects use different project names, container names, networks and volumes, so `docker compose` commands for V2 cannot affect V1. V2 must not be configured with the V1 token before cutover step C-6 (doc 06).
