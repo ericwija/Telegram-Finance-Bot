@@ -378,7 +378,7 @@ def test_init_roles_script_never_exposes_passwords() -> None:
     assert script.index("SET log_min_error_statement = 'panic'") < first_password
     # Passwords are read by psql from the secret files: never via argv or the environment.
     for var in ("owner_pw", "app_pw", "backup_pw"):
-        assert re.search(rf"\\set {var} `cat /run/secrets/db_\w+_password`", script), var
+        assert re.search(rf"\\set {var} `cat :'secrets_dir'/db_\w+_password`", script), var
         assert f"\\unset {var}" in script
     assert "--set ECHO" not in script
     assert "--echo" not in script
@@ -386,6 +386,61 @@ def test_init_roles_script_never_exposes_passwords() -> None:
     assert not re.search(r"(echo|printf)[^\n]*(\$\(cat|PGPASSWORD|_pw\b)", script)
     assert not re.search(r"^\s*set\s+-[a-zA-Z]*x", script, re.M), "no shell tracing"
     # PGPASSWORD may only be loaded from the superuser secret file, into the environment.
+    # The secrets directory is /run/secrets except in dev/test (disposable test clusters).
+    assert "secrets_dir=/run/secrets\n" in script
+    assert re.search(r"dev \| test\) secrets_dir=\"\$FINBOT_SECRETS_DIR\" ;;", script)
     assert re.findall(r"PGPASSWORD=[^\n]*", script) == [
         'PGPASSWORD="$(cat "$secrets_dir/db_superuser_password")"'
     ]
+
+
+# --------------------------------------------------------------- credential separation (S10)
+
+
+def _service_secrets(path: Path) -> dict[str, list[str]]:
+    """Map service name -> secret names, from the raw compose file (2-space YAML indentation)."""
+    services: dict[str, list[str]] = {}
+    section = current = None
+    in_secrets = False
+    for line in _code_lines(path):
+        if not line.strip():
+            continue
+        indent = len(line) - len(line.lstrip())
+        if indent == 0:
+            section = line.strip().rstrip(":")
+            current = None
+            continue
+        if section != "services":
+            continue
+        if indent == 2:
+            current = line.strip().rstrip(":")
+            services[current] = []
+            in_secrets = False
+        elif indent == 4 and current is not None:
+            in_secrets = line.strip() == "secrets:"
+        elif indent == 6 and in_secrets and current is not None:
+            item = line.strip().removeprefix("- ").strip()
+            services[current].append(item.removeprefix("source:").strip())
+    return services
+
+
+def test_owner_and_application_credentials_never_share_a_service() -> None:
+    services = _service_secrets(COMPOSE)
+    assert services["postgres"] == [
+        "db_superuser_password",
+        "db_owner_password",
+        "db_app_password",
+        "db_backup_password",
+    ], "parser sanity check: the database container provisions every role"
+    app_secrets = {"db_app_password", "telegram_token", "gemini_api_key"}
+    for name, used in services.items():
+        if name == "postgres":
+            continue
+        assert "db_superuser_password" not in used, name
+        if "db_owner_password" in used:
+            assert name == "migrate", (
+                f"only the migrate service may hold the owner password: {name}"
+            )
+            assert not app_secrets & set(used), f"migrate must not hold application secrets: {used}"
+        if name != "backup":
+            assert "db_backup_password" not in used, name

@@ -1,0 +1,94 @@
+# Telegram-Finance-Bot V2 continuous integration (decisions S2, D25 pending; docs/10 §5).
+#
+# - No secrets of any environment are used; database tests create their own random passwords.
+# - Nothing is deployed and nothing is pushed. Staging and production are never contacted.
+# - Third-party code is pinned: actions by commit SHA, uv by version + SHA-256, PostgreSQL by the
+#   image digest in deploy/staging/compose.yml (the same image staging runs).
+# - Database tests fail the job if any of them is skipped (FINBOT_REQUIRE_DB_TESTS=1).
+# V1 (main.py, requirements.txt) is not built or tested here.
+
+name: ci
+
+on:
+  push:
+    branches: [develop, main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  UV_VERSION: "0.12.23"
+  UV_SHA256: "9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6"
+  UV_PYTHON_PREFERENCE: only-managed
+  PYTHONDONTWRITEBYTECODE: "1"
+
+jobs:
+  checks:
+    name: lint, types, layering, unit tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv (checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/uv.tar.gz \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/uv.tar.gz -C /tmp
+          install -d "$HOME/.local/bin"
+          install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx "$HOME/.local/bin/"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Python 3.13 and locked dependencies
+        run: |
+          uv python install 3.13
+          uv sync --frozen
+          uv lock --check
+      - name: Lint, format, types, import layering
+        run: make lint type imports
+      - name: Tests without a database (includes AT-DEP-01 compose checks)
+        run: uv run pytest -m "not db" --cov
+
+  database:
+    name: database tests (PostgreSQL 18.6, pinned staging image)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      FINBOT_TEST_PG_BACKEND: container
+      FINBOT_REQUIRE_DB_TESTS: "1"
+      # The test container is stopped by the fixture and the runner is ephemeral, so the
+      # testcontainers reaper (an extra, unpinned image) is not needed.
+      TESTCONTAINERS_RYUK_DISABLED: "true"
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+      - name: Install uv (checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/uv.tar.gz \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          echo "${UV_SHA256}  /tmp/uv.tar.gz" | sha256sum --check --strict
+          tar -xzf /tmp/uv.tar.gz -C /tmp
+          install -d "$HOME/.local/bin"
+          install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx "$HOME/.local/bin/"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Python 3.13 and locked dependencies
+        run: |
+          uv python install 3.13
+          uv sync --frozen
+      - name: Pull the pinned PostgreSQL image (same digest as staging)
+        run: |
+          set -euo pipefail
+          image="$(sed -nE 's/^[[:space:]]*image:[[:space:]]*(postgres:[^[:space:]]+@sha256:[0-9a-f]{64})[[:space:]]*$/\1/p' deploy/staging/compose.yml)"
+          test -n "$image"
+          docker pull "$image"
+      - name: Database tests (fail if any is skipped)
+        run: make test-db

@@ -49,6 +49,14 @@ $$ SELECT nullif(current_setting('app.workspace_id', true), '')::uuid $$;
 
 An unset setting returns NULL. `workspace_id = NULL` is never true, so **zero rows** are visible (fail-closed).
 
+**Membership check (S5, approved 2026-10-24; implemented in Step 3B.3).** Policies also require that `app_user_id()` has an **active** membership in the row's workspace, not just a matching context. This is done through one helper, `app_is_active_member(ws uuid) RETURNS boolean`, with these rules so that no policy recurses into RLS and no definer function widens access:
+- `SECURITY DEFINER`, owned by `finbot_owner`, `STABLE`, `SET search_path = pg_catalog, public`, `EXECUTE` granted only to `finbot_app`;
+- it reads `workspace_memberships` directly (the owner bypasses RLS, so evaluating it never re-enters a policy) and returns a boolean only, never rows;
+- it compares only against `app_user_id()`, never a caller-supplied user ID;
+- policies call it as `(SELECT app_is_active_member(workspace_id))`, and the helpers as `(SELECT app_workspace_id())`, so they are planned once per query.
+
+Tests: AT-RLS-06, plus a recursion test (a policy on `workspace_memberships` that uses the helper must not loop).
+
 ### 4.2 Tenant tables
 
 Applies to `accounts`, `categories`, `transactions`, **`transaction_entries`**, `transaction_revisions`, `receipts`, `drafts`, `ai_usage`, `workspace_invitations` and `pending_actions` (rows with `workspace_id` set). The `current_entries` view is `security_invoker`, so the caller's RLS applies through it. D5 (approved): every table gets RLS in **the same migration that creates it**, starting with the Phase 1 baseline:
@@ -67,7 +75,7 @@ CREATE POLICY tenant_isolation ON transactions
 |---|---|
 | `workspaces` | `USING (id = app_workspace_id() OR id IN (SELECT workspace_id FROM workspace_memberships WHERE user_id = app_user_id() AND status = 'active'))`; `WITH CHECK (id = app_workspace_id())` |
 | `workspace_memberships` | `USING (workspace_id = app_workspace_id() OR user_id = app_user_id())`; `WITH CHECK (workspace_id = app_workspace_id())` |
-| `users` | `USING (id = app_user_id() OR id IN (SELECT user_id FROM workspace_memberships WHERE workspace_id = app_workspace_id()))`. Updates: `WITH CHECK (id = app_user_id())` |
+| `users` | `USING (id = app_user_id() OR id IN (SELECT user_id FROM workspace_memberships WHERE workspace_id = app_workspace_id()))`. Updates: `WITH CHECK (id = app_user_id())`, **plus column-level UPDATE grants (S7)**: `finbot_app` may update only `display_name`, `locale`, `timezone` and `updated_at`, never `is_platform_admin`, `status`, `email*` or `password_hash`. The same rule applies to every protected table: `id`, `workspace_id`, `created_*`, `kind` and `personal_owner_id` are never updatable by the app |
 | `user_preferences` | `USING (user_id = app_user_id()) WITH CHECK (user_id = app_user_id())` |
 | `audit_events` | SELECT `USING (workspace_id = app_workspace_id())`; INSERT `WITH CHECK (workspace_id IS NULL OR workspace_id = app_workspace_id())`; no UPDATE or DELETE grant to the app |
 | `telegram_identities`, `onboarding_invites`, `import_batches` | No direct grants to `finbot_app`. Access only through the `SECURITY DEFINER` functions below |
@@ -84,7 +92,8 @@ CREATE POLICY tenant_isolation ON transactions
 ### 4.4 Privileged operations
 
 - `FORCE ROW LEVEL SECURITY` applies to table owners too, so `finbot_owner` is created with **`BYPASSRLS`** for migrations, purge and retention pruning. Its credentials are mounted only into the `migrate` container and the purge/prune job entry point, never into the bot's request path.
-- **Migrations** run as `finbot_owner` in the one-shot `migrate` container.
+- **Migrations** run as `finbot_owner` in the one-shot `migrate` container, through `finbot-migrate`, the only entry point that accepts owner credentials (S10, doc 10 §2). The bot refuses `FINBOT_DB_OWNER_*` variables, and migrations refuse the app's.
+- **Immutability bypass (S6):** triggers that protect entries, revisions and audit rows allow UPDATE/DELETE only when `session_user = 'finbot_owner'`. `current_user` is not used, because inside any `SECURITY DEFINER` function owned by `finbot_owner` it *is* `finbot_owner`, even when `finbot_app` called it. Tested with a definer function in Step 3B.4.
 - **Workspace purge** (D13) runs as `finbot_owner`, from a job entry point that accepts only workspace IDs whose `status='pending_deletion' AND deletion_requested_at < now() - interval '30 days'`. It deletes in FK order, prunes revisions, and writes one platform-level `workspace.purged` audit event (`workspace_id` kept in metadata).
 - **Backup** uses `finbot_backup` (BYPASSRLS, SELECT only).
 
@@ -128,7 +137,7 @@ CREATE POLICY tenant_isolation ON transactions
 
 - `metadata` holds structured values only: IDs, enum values, amounts **before and after** for transaction edits, and changed field names. **No** descriptions, raw messages or AI text.
 - Audit rows are written in the same database transaction as the change (G-5). Denied attempts are written in their own short transaction.
-- Append-only: there is no UPDATE or DELETE grant for `finbot_app`, and a trigger raises an exception on UPDATE or DELETE unless the current user is `finbot_owner` (retention prune and purge).
+- Append-only: there is no UPDATE or DELETE grant for `finbot_app`, and a trigger raises an exception on UPDATE or DELETE unless `session_user = 'finbot_owner'` (retention prune and purge; S6, §4.4).
 
 ## 7. Secrets management
 

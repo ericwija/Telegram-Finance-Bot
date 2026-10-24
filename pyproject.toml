@@ -13,10 +13,15 @@ dependencies = [
     "pydantic>=2.9,<3",
     "pydantic-settings>=2.6,<3",
     "tzdata>=2024.1",  # zoneinfo data independent of the host/container OS
+    # Database (Step 3B, decision S3): SQLAlchemy 2.x async + asyncpg; Alembic runs as finbot_owner.
+    "sqlalchemy[asyncio]>=2.0.36,<2.1",
+    "asyncpg>=0.30,<1",
+    "alembic>=1.14,<2",
 ]
 
 [project.scripts]
 finbot = "finbot.__main__:main"
+finbot-migrate = "finbot.adapters.cli.migrate:main"  # owner-role entry point (decision S10)
 
 [dependency-groups]
 dev = [
@@ -26,6 +31,8 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "import-linter>=2.1",
+    "pytest-asyncio>=0.24",
+    "testcontainers[postgres]>=4.8,<5",  # CI database backend (pinned image digest)
 ]
 
 [build-system]
@@ -81,8 +88,11 @@ testpaths = ["tests"]
 pythonpath = ["."]  # makes the `tests` package importable for shared helpers
 addopts = ["-ra", "--strict-markers", "--strict-config", "--import-mode=importlib"]
 xfail_strict = true
+asyncio_mode = "strict"  # async tests/fixtures must opt in explicitly
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
 markers = [
-    "db: needs PostgreSQL via Docker/testcontainers (from Phase 1 Step 3)",
+    "db: needs a disposable PostgreSQL 18.6 cluster (FINBOT_TEST_PG_BACKEND; docs/10 §4)",
     "slow: long-running test",
 ]
 

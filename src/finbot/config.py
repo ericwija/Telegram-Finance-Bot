@@ -48,6 +48,15 @@ DB_NAME_BY_ENV: Mapping[str, str] = {
 #: The runtime must never connect as a privileged role (NFR-SEC-03, docs/05 §8).
 FORBIDDEN_APP_DB_USERS: frozenset[str] = frozenset({"postgres", "finbot_owner", "finbot_backup"})
 
+#: Variables for privileged database roles. They belong to ``finbot-migrate`` (owner), the
+#: backup job or the database container, never to the application (decision S10).
+PRIVILEGED_ENV_PREFIXES: tuple[str, ...] = (
+    "FINBOT_DB_OWNER_",
+    "FINBOT_DB_BACKUP_",
+    "FINBOT_DB_SUPERUSER_",
+    "FINBOT_MIGRATION_",
+)
+
 #: Names of secret settings. Each has a companion ``<name>_file`` setting.
 SECRET_FIELDS: tuple[str, ...] = ("db_app_password", "telegram_token", "gemini_api_key")
 
@@ -80,7 +89,7 @@ def env_var_name(field_name: str) -> str:
     return f"{ENV_PREFIX}{field_name.upper()}"
 
 
-def _read_secret_file(raw_path: str, *, strict: bool, var_name: str) -> str:
+def read_secret_file(raw_path: str, *, strict: bool, var_name: str) -> str:
     """Read one secret from a file. Error messages mention the variable and path, never content."""
     path = Path(raw_path)
     if strict and not path.is_absolute():
@@ -173,7 +182,7 @@ class Settings(BaseSettings):
                     f"set either {env_var_name(name)} or {env_var_name(name + '_file')}, not both"
                 )
             if file_path is not None:
-                values[name] = _read_secret_file(
+                values[name] = read_secret_file(
                     str(file_path), strict=strict, var_name=env_var_name(name + "_file")
                 )
                 sources[name] = SecretSource.FILE
@@ -324,19 +333,26 @@ def load_settings(environ: Mapping[str, str] | None = None) -> Settings:
     """
     env = os.environ if environ is None else environ
     known = known_env_vars()
-    unknown = sorted(
-        key for key in env if key.upper().startswith(ENV_PREFIX) and key.upper() not in known
-    )
-    if unknown:
-        raise ConfigurationError([f"unknown setting {key}" for key in unknown])
+    problems: list[str] = []
+    for key in sorted(env):
+        upper = key.upper()
+        if upper.startswith(PRIVILEGED_ENV_PREFIXES):
+            problems.append(
+                f"{key} is a privileged database/migration setting and must never be given to "
+                "the application (S10)"
+            )
+        elif upper.startswith(ENV_PREFIX) and upper not in known:
+            problems.append(f"unknown setting {key}")
+    if problems:
+        raise ConfigurationError(problems)
     try:
         # Values come from the environment through pydantic-settings, not from arguments.
         return Settings()
     except ValidationError as exc:
-        problems: list[str] = []
+        found: list[str] = []
         for error in exc.errors(include_url=False, include_input=False, include_context=False):
             loc = ".".join(str(part) for part in error["loc"])
             field = env_var_name(loc) if loc else "settings"
             message = error["msg"].removeprefix("Value error, ")
-            problems.append(f"{field}: {message}" if loc else message)
-        raise ConfigurationError(problems) from None
+            found.append(f"{field}: {message}" if loc else message)
+        raise ConfigurationError(found) from None

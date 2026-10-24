@@ -11,7 +11,7 @@
 | Level | Scope | Tooling | Runs |
 |---|---|---|---|
 | **Unit** | `domain/` (money, parsers, date resolution), `authz/policy`, rendering, callback codec | pytest, hypothesis | Every push |
-| **Integration** | Services + repositories against **real PostgreSQL 18**, using the same pinned image digest as `deploy/staging/compose.yml`, with migrations applied; RLS; constraints | pytest-asyncio, testcontainers | Every push (needs Docker; marked `@pytest.mark.db`, skipped locally if Docker is absent, never skipped in CI) |
+| **Integration** | Services + repositories against **real PostgreSQL 18**, using the same pinned image digest as `deploy/staging/compose.yml`, with migrations applied; RLS; constraints | pytest-asyncio; testcontainers (CI) or user-space PostgreSQL 18.6 (development), doc 10 §4 | Every push. Marked `@pytest.mark.db`; backend via `FINBOT_TEST_PG_BACKEND`. Skipped (and reported) only in a plain local run without a backend; `make test-db` and CI **fail** if any database test is skipped |
 | **Authorization** | Matrix and rule tests through the **service layer** (§3) | Generated parametrized tests | Every push |
 | **Adapter** | Telegram handlers with synthetic `Update` objects and a fake Bot (records outgoing calls) | PTB test utilities | Every push |
 | **AI contract** | Prompt → schema-validated output, using **recorded** Gemini responses; no network in CI | Fixtures + schema | Every push |
@@ -207,6 +207,8 @@ All run as `finbot_app` against PostgreSQL 18 at **both** the service level and 
 | AT-STATE-01 | Restart | Kill the bot mid-flow, restart, and confirm the pending draft → succeeds |
 
 ## 6. Migration tests (AT-MIG)
+
+AT-MIG-* covers the **V1 → V2 data import** (Phase 7). Schema-migration tests (Alembic lifecycle, guard, downgrade policy) use the prefix **AT-SCH-*** (Step 3B.5, doc 10).
 
 | ID | Scenario | Expected |
 |---|---|---|

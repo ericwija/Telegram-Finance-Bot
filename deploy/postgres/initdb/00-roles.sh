@@ -20,6 +20,9 @@
 # No schema objects and no grants are created here: they belong to Alembic, as finbot_owner.
 #
 # Secrets are read by psql itself from /run/secrets (never via argv, environment or logs).
+# Disposable dev/test clusters (tests/support/pg.py) may point FINBOT_SECRETS_DIR at a private
+# temporary directory instead; every other environment refuses that variable, so staging,
+# production and drill always use the Docker secrets mounted at /run/secrets.
 # Statement logging is disabled for this session so CREATE/ALTER ROLE ... PASSWORD is never
 # logged, and psql runs quietly with terse errors (no statement echo).
 set -Eeuo pipefail
@@ -42,6 +45,17 @@ esac
 [ "$FINBOT_DB_NAME" = "$expected_db" ] || die "FINBOT_DB_NAME must be $expected_db for $FINBOT_ENV (G-ENV-2)"
 
 secrets_dir=/run/secrets
+if [ -n "${FINBOT_SECRETS_DIR:-}" ]; then
+	case "$FINBOT_ENV" in
+		dev | test) secrets_dir="$FINBOT_SECRETS_DIR" ;;
+		*) die "FINBOT_SECRETS_DIR is only allowed for dev/test; $FINBOT_ENV uses /run/secrets" ;;
+	esac
+	case "$secrets_dir" in
+		/*) ;;
+		*) die "FINBOT_SECRETS_DIR must be an absolute path" ;;
+	esac
+	[ -d "$secrets_dir" ] || die "FINBOT_SECRETS_DIR is not a directory"
+fi
 names=(db_superuser_password db_owner_password db_app_password db_backup_password)
 for name in "${names[@]}"; do
 	file="$secrets_dir/$name"
@@ -71,7 +85,7 @@ rm -f "$FINBOT_INIT_MARKER"
 
 psql --no-psqlrc --quiet --set ON_ERROR_STOP=1 --set VERBOSITY=terse --set SHOW_CONTEXT=never \
 	--username "$POSTGRES_USER" --no-password --dbname postgres \
-	--set dbname="$FINBOT_DB_NAME" <<'SQL'
+	--set dbname="$FINBOT_DB_NAME" --set secrets_dir="$secrets_dir" <<'SQL'
 -- Never log this session's statements: they contain role passwords.
 SET log_statement = 'none';
 SET log_min_duration_statement = -1;
@@ -83,9 +97,10 @@ FROM unnest(ARRAY['finbot_owner', 'finbot_app', 'finbot_backup', 'finbot_readonl
 WHERE NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = r)
 \gexec
 
-\set owner_pw `cat /run/secrets/db_owner_password`
-\set app_pw `cat /run/secrets/db_app_password`
-\set backup_pw `cat /run/secrets/db_backup_password`
+-- :'secrets_dir' is shell-quoted by psql inside backquotes (psql manual, "Interpolation").
+\set owner_pw `cat :'secrets_dir'/db_owner_password`
+\set app_pw `cat :'secrets_dir'/db_app_password`
+\set backup_pw `cat :'secrets_dir'/db_backup_password`
 
 ALTER ROLE finbot_owner LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION
     BYPASSRLS CONNECTION LIMIT 5 PASSWORD :'owner_pw';

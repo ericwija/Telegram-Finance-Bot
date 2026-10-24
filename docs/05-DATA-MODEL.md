@@ -325,7 +325,7 @@ JOIN transactions t
 | Trigger | Fires | Enforces |
 |---|---|---|
 | `trg_entries_balanced` | CONSTRAINT TRIGGER, **DEFERRABLE INITIALLY DEFERRED**, AFTER INSERT on `transaction_entries` and AFTER INSERT/UPDATE OF `amount, entry_revision, type` on `transactions` | At COMMIT, for each touched transaction, the entry set at `revision = entry_revision` satisfies INV-2…INV-5. No entry set exists with `revision > entry_revision` |
-| `trg_entries_immutable` | BEFORE UPDATE OR DELETE on `transaction_entries` | Raises unless `current_user = 'finbot_owner'` (purge). Backed by grants: `finbot_app` has only INSERT and SELECT |
+| `trg_entries_immutable` | BEFORE UPDATE OR DELETE on `transaction_entries` | Raises unless `session_user = 'finbot_owner'` (S6: `current_user` would be `finbot_owner` inside any owner-owned `SECURITY DEFINER` function) (purge). Backed by grants: `finbot_app` has only INSERT and SELECT |
 | `trg_txn_type_immutable` | BEFORE UPDATE OF `type` on `transactions` | Raises (D21: type changes go through void + replace) |
 | `trg_entries_active_account` | BEFORE INSERT on `transaction_entries` | The account is not archived (new movements only; history keeps archived accounts) |
 | `trg_txn_active_category` | BEFORE INSERT/UPDATE OF `category_id` on `transactions` | The category is not archived |
@@ -438,7 +438,7 @@ CREATE TABLE audit_events (
   metadata       jsonb NOT NULL DEFAULT '{}'   -- structured, redacted; no free-text descriptions
 );
 CREATE INDEX ix_audit_ws_time ON audit_events(workspace_id, occurred_at DESC);
--- Append-only: app role has INSERT+SELECT only; trigger raises on UPDATE/DELETE except by purge role.
+-- Append-only: app role has INSERT+SELECT only; trigger raises on UPDATE/DELETE unless session_user = 'finbot_owner' (S6).
 
 CREATE TABLE ai_usage (
   id             uuid PRIMARY KEY,
@@ -551,7 +551,7 @@ Reconciliation output (`import_batches.stats`): for each user, rows read, import
 
 | Phase / step | Alembic revisions create |
 |---|---|
-| **P1 Step 3** (DB foundation) | Roles `finbot_owner` (BYPASSRLS), `finbot_app`, `finbot_backup` (BYPASSRLS), `finbot_readonly` (NOLOGIN); extension `citext`; `platform_meta` with the environment marker; RLS helpers `app_user_id()` and `app_workspace_id()`; tables `users`, `workspaces`, `workspace_memberships` (**without** `default_account_id`), `audit_events`, each with RLS ENABLE + FORCE and its policies (D5); the audit append-only trigger; `trg_personal_membership_is_owner`; `trg_business_has_owner` |
+| **P1 Step 3** (DB foundation) | **Roles are not created by Alembic**: `finbot_owner` (BYPASSRLS), `finbot_app`, `finbot_backup` (BYPASSRLS) and `finbot_readonly` (NOLOGIN) come from `deploy/postgres/initdb/00-roles.sh` (doc 04 §8.2), and `finbot_owner` has no CREATEROLE. Alembic (as `finbot_owner`, Step 3B.3) creates: database-level `REVOKE CONNECT, TEMP … FROM PUBLIC` plus explicit grants and default privileges; extension `citext`; `platform_meta` with the environment marker; RLS helpers `app_user_id()` and `app_workspace_id()`; tables `users`, `workspaces`, `workspace_memberships` (**without** `default_account_id`), `audit_events`, each with RLS ENABLE + FORCE and its policies (D5); the audit append-only trigger; `trg_personal_membership_is_owner`; `trg_business_has_owner` |
 | **P2** | `telegram_identities`, `onboarding_invites`, `workspace_invitations`, `user_preferences`, `pending_actions`; the `SECURITY DEFINER` functions (doc 09 §4.3) |
 | **P3** | `accounts`, `categories`, `receipts` (shell), `transactions`, **`transaction_entries`**, `transaction_revisions`, `drafts`, the `current_entries` view, all §5.2 triggers; ADD COLUMN `workspace_memberships.default_account_id` + composite FK |
 | **P4** | `ai_usage`; receipt extraction columns, if any are deferred from P3 |

@@ -20,6 +20,7 @@
 | 07 | [Test & Acceptance Plan](07-TEST-AND-ACCEPTANCE-PLAN.md) | Test strategy, authorization tests, UAT |
 | 08 | [RBAC Matrix](08-RBAC-MATRIX.md) | Roles, permissions, precise rules |
 | 09 | [Tenant Isolation & Security](09-TENANT-ISOLATION-AND-SECURITY.md) | Isolation layers, RLS, threat model, backup security |
+| 10 | [Database Migrations & Testing](10-DATABASE-MIGRATIONS-AND-TESTING.md) | Alembic workflow, credential separation, database test harness, CI, Step 3B decisions S1–S11 |
 
 ---
 

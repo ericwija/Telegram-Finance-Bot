@@ -5,7 +5,7 @@ Guidance for Claude Code (and humans) working in this repository.
 ## Project state (as of 2026-10-24)
 
 - **V1 (legacy, in production):** `main.py`, a single-file python-telegram-bot app with Google Sheets as storage. Known issues are catalogued in `PROJECT_AUDIT.md`.
-- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Steps 1 (decision reconciliation) and 2 (package skeleton, config, testing foundation; doc 06 §6) are done; Step 3A (infrastructure audit, staging PostgreSQL design in `deploy/staging/`) is accepted as a configuration baseline; **runtime deployment of staging is not yet approved** (nothing pulled or started). Step 3B (Alembic baseline + RLS) has not started. **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB), **D23** (Python 3.13 + uv); **2026-10-24: D24** (staging runs on the existing Contabo VPS, isolated by compose project, network, volume and secrets; drill placement still open). Its full specification is in `docs/` (read these before any V2 work):
+- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Steps 1 (decision reconciliation) and 2 (package skeleton, config, testing foundation; doc 06 §6) are done; Step 3A is complete: the staging PostgreSQL 18.6 (`finbot-staging`) is running, operated by `deploy` (`claude` never connects to it). Step 3B.2 (migration tooling, credential separation, database test harness, CI workflow; doc 10): local validation complete (10/10 database tests passed on a user-space PostgreSQL 18.6, Step 3B.2A); CI pending; **no schema revision exists yet** (3B.3). Step 3B decisions **S1–S11** were approved 2026-10-24 (doc 10 §8). **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB), **D23** (Python 3.13 + uv); **2026-10-24: D24** (staging runs on the existing Contabo VPS, isolated by compose project, network, volume and secrets; drill placement still open). Its full specification is in `docs/` (read these before any V2 work):
 
 | Doc | Read when |
 |---|---|
@@ -18,6 +18,7 @@ Guidance for Claude Code (and humans) working in this repository.
 | `docs/07-TEST-AND-ACCEPTANCE-PLAN.md` | Writing tests; test IDs (AT-*) |
 | `docs/08-RBAC-MATRIX.md` | Anything touching permissions |
 | `docs/09-TENANT-ISOLATION-AND-SECURITY.md` | Anything touching data access, RLS, secrets, backups |
+| `docs/10-DATABASE-MIGRATIONS-AND-TESTING.md` | Migrations, `finbot-migrate`, database tests, CI, decisions S1–S11 |
 
 If code and docs disagree, **stop and ask**. Do not silently pick one. Decisions still marked open in doc 01 §8 must not be assumed beyond their documented default without saying so.
 
@@ -31,7 +32,7 @@ If code and docs disagree, **stop and ask**. Do not silently pick one. Decisions
 6. **Audit** every state change in the same DB transaction (event catalogue in doc 09 §6).
 7. **No PII or financial text in logs**: no descriptions, raw messages, prompts, AI responses or amounts. Use the structured logger only, never `print`.
 8. **Secrets** come only from `*_FILE` paths and Docker secrets. Never hard-code, log or commit them, and never echo `.env` contents.
-9. **Schema changes only through Alembic**, expand/contract style, each with a downgrade or a documented forward-fix.
+9. **Schema changes only through Alembic**, expand/contract style, each with a downgrade or a documented forward-fix. Revisions are hand-written with manual ids (`--rev-id NNNN`, never autogenerate); downgrades run only in dev/test/drill (S9). Only `finbot-migrate` may hold `finbot_owner` credentials; the bot must never receive them (S10).
 10. **Layering:** `adapters → services → authz/domain`; `infra` implements `ports`. No imports from `adapters` into `services` or `domain`, and no I/O at import time.
 11. **Rendering:** Telegram `parse_mode=HTML` with `html.escape()` on every interpolated user or AI string.
 12. **New tenant table checklist:** `workspace_id`, a composite FK, RLS + FORCE + policy, indexes, an AT-RLS-COVERAGE pass, and isolation tests.
@@ -45,7 +46,7 @@ If code and docs disagree, **stop and ask**. Do not silently pick one. Decisions
 
 ```
 src/finbot/{domain,authz,services,ports,infra,adapters}/   # see doc 04 §4
-migrations/        # Alembic
+migrations/        # Alembic (env.py delegates to finbot.infra.db.migration_runtime)
 tests/{unit,integration,authz,adapter,migration}/
 deploy/            # compose files, backup scripts, runbooks (secrets/ is git-ignored)
 docs/              # specifications (this set)
@@ -60,12 +61,14 @@ uv sync --frozen                         # install exactly what uv.lock pins (in
 uv run ruff format --check . && uv run ruff check .
 uv run mypy                              # strict, src/finbot
 uv run lint-imports --no-cache           # layering contracts (pyproject [tool.importlinter])
-uv run pytest --cov                      # all tests; @pytest.mark.db tests need Docker (Step 3+)
+uv run pytest --cov                      # all tests; @pytest.mark.db tests skip (and are reported) without a backend
+make test-db                             # database tests only; FINBOT_TEST_PG_BACKEND=userspace|container; fails on any skip
+uv run finbot-migrate check-config|upgrade|current|history|sql upgrade head   # owner-role migrations (doc 10 §3)
 uv run finbot check-config [--json]      # validate FINBOT_* config offline; exit 0 ok / 2 invalid
 make check                               # lint + type + imports + test
 ```
 
-Configuration: only `FINBOT_*` environment variables are read, and no `.env` file is loaded implicitly. Secrets use `FINBOT_<NAME>_FILE`, and plaintext secrets are rejected in staging/production/drill. The example is in `deploy/env/finbot.env.example`.
+Configuration: only `FINBOT_*` environment variables are read, and no `.env` file is loaded implicitly. Secrets use `FINBOT_<NAME>_FILE`, and plaintext secrets are rejected in staging/production/drill. The example is in `deploy/env/finbot.env.example`. Migrations use a separate, disjoint set (`FINBOT_DB_OWNER_PASSWORD_FILE`, `FINBOT_MIGRATION_ALLOW_DOWNGRADE`; doc 10 §2); each loader refuses the other's secrets.
 
 Logging: use `logging.getLogger(__name__)` and pass only allow-listed `extra=` fields (`finbot.logging.ALLOWED_EXTRA_FIELDS`). String `%s` arguments are redacted unless wrapped in `finbot.logging.safe(...)`.
 

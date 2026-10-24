@@ -5,11 +5,26 @@ not real (see ``fake_telegram_token``).
 """
 
 import os
-import shutil
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
+
+# Database-test hooks and fixtures (backend selection, skip detection; docs/10 §4). Imported
+# names are registered by pytest as if defined here.
+from tests.plugins.db import (  # noqa: F401
+    alembic_config,
+    app_engine,
+    migration_settings,
+    owner_engine,
+    pg_cluster,
+    pytest_collection_modifyitems,
+    pytest_configure,
+    pytest_runtest_logreport,
+    pytest_sessionfinish,
+    pytest_terminal_summary,
+    test_database,
+)
 
 SENTINEL_SECRET = "ZZ-NOT-A-REAL-SECRET-ZZ"
 
@@ -54,20 +69,3 @@ def staging_env(
     for key, value in values.items():
         monkeypatch.setenv(key, value)
     return values
-
-
-def _docker_available() -> bool:
-    return shutil.which("docker") is not None
-
-
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Skip ``@pytest.mark.db`` tests without Docker locally. In CI, missing Docker is an error."""
-    if _docker_available():
-        return
-    db_items = [item for item in items if "db" in item.keywords]
-    if not db_items:
-        return
-    if os.environ.get("CI", "").lower() in {"1", "true", "yes"}:
-        raise pytest.UsageError("database tests selected but Docker is unavailable in CI")
-    for item in db_items:
-        item.add_marker(pytest.mark.skip(reason="Docker not available"))
