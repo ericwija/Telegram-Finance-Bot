@@ -5,7 +5,7 @@ Guidance for Claude Code (and humans) working in this repository.
 ## Project state (as of 2026-10-23)
 
 - **V1 (legacy, in production):** `main.py`, a single-file python-telegram-bot app with Google Sheets as storage. Known issues are catalogued in `PROJECT_AUDIT.md`.
-- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Step 1 (decision reconciliation) is done; Step 2 (package skeleton, config, testing foundation; checklist in doc 06 §6) awaits owner approval and D23. **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB). Its full specification is in `docs/` (read these before any V2 work):
+- **V2 (Phase 1 in progress):** a multi-tenant, Telegram-first personal and business finance app on PostgreSQL 18. Steps 1 (decision reconciliation) and 2 (package skeleton, config, testing foundation; doc 06 §6) are done; Step 3 (database foundation) awaits owner review. **Approved decisions (2026-10-23): D1** (transfers = header + 2 balancing entries), **D5** (RLS from Phase 1), **D9** (PostgreSQL 18 in Docker, pinned, no public port), **D11** (Sheets is not a system of record; optional export later), **D18** (separate staging bot and DB), **D23** (Python 3.13 + uv). Its full specification is in `docs/` (read these before any V2 work):
 
 | Doc | Read when |
 |---|---|
@@ -41,7 +41,7 @@ If code and docs disagree, **stop and ask**. Do not silently pick one. Decisions
 - **Do not refactor `main.py`.** V1 is frozen except for owner-approved Phase 0 keep-alive fixes (doc 06).
 - Do not add features to V1. New work goes into V2 (`src/finbot/`).
 
-## Planned layout (V2; created in Phase 1)
+## Layout (V2; skeleton created in Phase 1 Step 2, filled in later phases)
 
 ```
 src/finbot/{domain,authz,services,ports,infra,adapters}/   # see doc 04 §4
@@ -53,22 +53,29 @@ docs/              # specifications (this set)
 
 ## Commands
 
-V2 tooling does not exist yet. Phase 1 will add these, and this section should be updated when it does:
+V2 uses **uv** (D23; pinned to `>=0.12,<0.13` in `pyproject.toml`) with Python 3.13 and the committed `uv.lock`. Never edit `uv.lock` by hand; change `pyproject.toml` and run `uv lock`.
 
 ```
-uv sync / pip install -r requirements.lock      # install (pinned, hashed)
-pytest                                           # all tests (needs Docker for testcontainers)
-pytest tests/authz                               # authorization matrix + rules
-ruff check . && ruff format --check . && mypy src
-lint-imports                                     # layering contract
-docker compose -f deploy/compose.staging.yml up -d
+uv sync --frozen                         # install exactly what uv.lock pins (incl. dev group)
+uv run ruff format --check . && uv run ruff check .
+uv run mypy                              # strict, src/finbot
+uv run lint-imports --no-cache           # layering contracts (pyproject [tool.importlinter])
+uv run pytest --cov                      # all tests; @pytest.mark.db tests need Docker (Step 3+)
+uv run finbot check-config [--json]      # validate FINBOT_* config offline; exit 0 ok / 2 invalid
+make check                               # lint + type + imports + test
 ```
+
+Configuration: only `FINBOT_*` environment variables are read, and no `.env` file is loaded implicitly. Secrets use `FINBOT_<NAME>_FILE`, and plaintext secrets are rejected in staging/production/drill. The example is in `deploy/env/finbot.env.example`.
+
+Logging: use `logging.getLogger(__name__)` and pass only allow-listed `extra=` fields (`finbot.logging.ALLOWED_EXTRA_FIELDS`). String `%s` arguments are redacted unless wrapped in `finbot.logging.safe(...)`.
+
+Planned for later steps: `docker compose -f deploy/compose.staging.yml up -d` (Step 5).
 
 V1: `python main.py` (needs `.env`) or `docker compose up -d` (root `docker-compose.yml`).
 
 ## Conventions
 
-- Python 3.13 with `uv` (D23, pending approval), type hints throughout, `ruff` formatting.
+- Python 3.13 with `uv` (D23, approved), type hints throughout, `ruff` formatting.
 - Environments: `dev`, `test`, `staging`, `production`, `drill`. Never point staging config at production resources, never put production data in staging, and never publish the Postgres port on a VPS (doc 04 §8.2–8.3).
 - User-facing text is in **Indonesian**, kept in the message catalog (`adapters/telegram/messages_id.py`). Code, comments and docs are in English.
 - IDs are UUIDv7 generated in the application.

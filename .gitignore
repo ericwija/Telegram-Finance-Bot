@@ -74,3 +74,10 @@ backups/
 tmp/
 temp/
 *.tmp
+# ---- V2 (finbot) ----
+deploy/secrets/
+.ruff_cache/
+.mypy_cache/
+.coverage.*
+.import_linter_cache/
+!deploy/env/

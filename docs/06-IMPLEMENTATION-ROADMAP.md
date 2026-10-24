@@ -120,7 +120,7 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | **AC-P4-04** | Quota exceeded → local parser for text and a friendly refusal for receipts, both tested. |
 | **AC-P4-05** | The receipt fixture set (≥ 20 real Indonesian receipts, anonymized) reconciles the total within Rp 1 for ≥ 85%. The rest show the mismatch warning. |
 | **AC-P4-06** | No receipt image is written to disk or the DB (AT-PRIV-RCPT-01). Logs contain no prompt or response text (AT-LOG-01). |
-| **Rollback** | Feature flag `AI_ENABLED=false` → the local parser only. |
+| **Rollback** | Feature flag `FINBOT_AI_ENABLED=false` → the local parser only. |
 | **Needs before start** | D7, D8 approved; the Gemini paid-tier account is set up. |
 
 ---
@@ -210,7 +210,7 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | Schema migration | Expand/contract: additive migrations first; destructive steps only in a later release once the code no longer uses the column. Every migration has a tested `downgrade` **or** a documented forward-fix. A backup is taken automatically before `migrate` runs in production. |
 | Data correction | Use void and restore plus revisions and entry revisions; never ad-hoc SQL on production without a backup and an audit entry (`ops.manual_data_fix`). |
 | Catastrophic | Whole-DB restore (doc 09 §9), with owner approval; all tenants roll back to the backup point. |
-| Feature | Flags (`AI_ENABLED`, `RECEIPTS_ENABLED`, `EXPORT_ENABLED`, `INVITES_ENABLED`) can be switched off without a deploy (env + restart). |
+| Feature | Flags (`FINBOT_AI_ENABLED`, `FINBOT_RECEIPTS_ENABLED`, `FINBOT_EXPORT_ENABLED`, `FINBOT_INVITES_ENABLED`) can be switched off without a deploy (env + restart). |
 
 ## 4. Branching & release
 
@@ -246,7 +246,7 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | 4 | `.importlinter` (or a `[tool.importlinter]` section) | Contracts: **layers** `finbot.adapters` > `finbot.services` > `finbot.authz` > `finbot.domain`; **forbidden** `finbot.domain` → `finbot.infra`, `finbot.adapters`, `pydantic_settings`, `sqlalchemy`, `telegram`; **independence** among `finbot.adapters.*` |
 | 5 | `src/finbot/__init__.py` | `__version__` only; no side effects |
 | 6 | `src/finbot/__main__.py` | `main()` with argparse subcommands: `check-config` (load and validate settings, print a **masked** summary, exit 0/2) and `version`. No network, DB or Telegram in Step 2 |
-| 7 | `src/finbot/config.py` | `Settings(BaseSettings)`: `finbot_env: Literal['dev','test','staging','production','drill']` (required, G-ENV-1); `log_level`; `default_timezone='Asia/Jakarta'` (validated with `zoneinfo`); `db_host`, `db_port=5432`, `db_name`, `db_app_user='finbot_app'`, `db_app_password: SecretStr` loaded from `db_app_password_file`; `telegram_token: SecretStr` from `telegram_token_file`; `telegram_expected_bot_username`; `gemini_api_key_file` (optional; `ai_enabled=False` default); feature flags `AI_ENABLED`, `RECEIPTS_ENABLED`, `EXPORT_ENABLED`, `INVITES_ENABLED`. **Validators:** `db_name == expected_db_name(env)` (G-ENV-2, static part); in `staging`/`production` inline secret env vars are rejected (G-ENV-5); `*_FILE` must exist, be a regular file, and (non-dev) not be group- or world-readable; `repr` and `model_dump` never reveal secrets. `load_settings()` is called explicitly, **never at import** |
+| 7 | `src/finbot/config.py` | `Settings(BaseSettings)` reading **only `FINBOT_`-prefixed** environment variables (no implicit `.env`; unknown `FINBOT_*` names are rejected): `FINBOT_ENV` ∈ `dev`/`test`/`staging`/`production`/`drill` (required, G-ENV-1); `FINBOT_LOG_LEVEL`; `FINBOT_DEFAULT_TIMEZONE=Asia/Jakarta` (validated with `zoneinfo`); `FINBOT_DB_HOST`, `FINBOT_DB_PORT=5432`, `FINBOT_DB_NAME`, `FINBOT_DB_APP_USER=finbot_app`, `FINBOT_DB_APP_PASSWORD_FILE` (→ `SecretStr`); `FINBOT_TELEGRAM_TOKEN_FILE`; `FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME`; `FINBOT_GEMINI_API_KEY_FILE` (optional; required only when `FINBOT_AI_ENABLED=true`); feature flags `FINBOT_AI_ENABLED`, `FINBOT_RECEIPTS_ENABLED`, `FINBOT_EXPORT_ENABLED`, `FINBOT_INVITES_ENABLED` (all default `false`). Each secret may be given as `FINBOT_<NAME>` or `FINBOT_<NAME>_FILE`, never both. **Validators:** `FINBOT_DB_NAME == expected_db_name(env)` (G-ENV-2, static part); in `staging`/`production`/`drill` plaintext secret variables are rejected (G-ENV-5); `*_FILE` must be a regular, non-empty file (≤ 64 KiB), never world-writable, and in `staging`/`production`/`drill` an absolute path that is not world-readable (group-read is allowed for the container's non-root uid); `repr` and `model_dump` never reveal secrets. `load_settings()` is called explicitly, **never at import** |
 | 8 | `src/finbot/logging.py` | `configure_logging(settings)`; JSON formatter (stdlib); **allow-listed** extra fields (`request_id`, `user_id`, `workspace_id`, `event`, `duration_ms`, `outcome`, `env`); a `RedactionFilter` that drops non-allow-listed extras and masks token-like strings (Telegram token pattern, Google API-key pattern, `postgresql://user:pass@`) |
 | 9 | `src/finbot/{domain,authz,services,ports,infra,adapters}/__init__.py` | Empty packages with a module docstring stating the layer rule (doc 04 §3). `adapters/{telegram,cli,jobs}/__init__.py`, `infra/{db,ai}/__init__.py` likewise |
 | 10 | `src/finbot/py.typed` | PEP 561 marker |
@@ -257,7 +257,7 @@ Phase 1 runs as **five owner-reviewed steps**. Each step stops for owner review 
 | 15 | `tests/unit/test_cli.py` | `finbot check-config` exits 0 with valid test settings and 2 with invalid ones; output contains no secret values |
 | 16 | `tests/architecture/test_layers.py` | Runs the import-linter contracts from pytest, and a test that a deliberately bad import (a fixture module) is detected |
 | 17 | `tests/{integration,authz,adapter,migration}/__init__.py` | Placeholders with a README line pointing to doc 07 (no tests yet) |
-| 18 | `deploy/env/finbot.env.example` | Non-secret settings for staging (`FINBOT_ENV=staging`, `DB_NAME=finbot_staging`, `*_FILE=/run/secrets/...`) with placeholder values only |
+| 18 | `deploy/env/finbot.env.example` | Non-secret settings for staging (`FINBOT_ENV=staging`, `FINBOT_DB_NAME=finbot_staging`, `FINBOT_*_FILE=/run/secrets/...`) with placeholder values only |
 | 19 | `Makefile` (optional) | `lint`, `type`, `test`, `check` wrappers around `uv run …` |
 
 ### 6.2 Files to modify (non-application, owner-visible)
