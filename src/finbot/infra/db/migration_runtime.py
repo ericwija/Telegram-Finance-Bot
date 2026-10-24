@@ -195,6 +195,20 @@ $finbot_guard$"""  # noqa: S608 - every interpolated value passed _sql_literal o
     ]
 
 
+def environment_literal() -> str:
+    """The running migration's ``FINBOT_ENV`` as a validated SQL string literal.
+
+    For revisions only (the ``platform_meta`` environment marker): it reads the settings that
+    :func:`run_env` placed on the Alembic config, so online and offline runs render the same value.
+    """
+    from alembic import context  # noqa: PLC0415
+
+    settings = context.config.attributes.get(SETTINGS_ATTRIBUTE)
+    if not isinstance(settings, MigrationSettings):
+        raise MigrationRefusedError("migration settings are not available to the revision")
+    return _sql_literal(settings.env)
+
+
 # ------------------------------------------------------------------------------ downgrades
 
 
@@ -304,6 +318,7 @@ def run_env(context: "EnvironmentContext") -> None:
     settings = config.attributes.get(SETTINGS_ATTRIBUTE)
     if settings is None:
         settings = load_migration_settings(require_password=not offline)
+        config.attributes[SETTINGS_ATTRIBUTE] = settings  # read by revisions (environment marker)
     _refuse_by_cli_command(context, settings)
     check_revision_policy(ScriptDirectory.from_config(config))
 

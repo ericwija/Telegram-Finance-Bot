@@ -238,3 +238,12 @@ def alembic_config(migration_settings: Any) -> Any:
     from finbot.adapters.cli.migrate import DEFAULT_INI, alembic_config  # noqa: PLC0415
 
     return alembic_config(DEFAULT_INI, migration_settings, io.StringIO())
+
+
+@pytest.fixture
+def migrated_database(alembic_config: Any, test_database: str) -> str:
+    """The per-test database upgraded to head by the repository's migrations, as finbot_owner."""
+    from alembic import command  # noqa: PLC0415
+
+    command.upgrade(alembic_config, "head")
+    return test_database

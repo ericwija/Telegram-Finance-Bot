@@ -15,6 +15,7 @@ import pytest
 from tests.plugins.db import (  # noqa: F401
     alembic_config,
     app_engine,
+    migrated_database,
     migration_settings,
     owner_engine,
     pg_cluster,

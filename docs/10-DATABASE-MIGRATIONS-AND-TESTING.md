@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phase 1 Step 3B.2 (tooling only): migration environment, credential separation, test harness, CI workflow. **No schema revisions yet**; the Phase 1 baseline is Step 3B.3 |
+| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) and **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9). Awaiting owner review; CI has not run |
 | **Date** | 2026-10-24 |
 | **Decisions** | S1–S11 approved 2026-10-24 (§8); D9, D18, D24 (doc 01 §8) |
 | **Related** | [04 Architecture](04-LOGICAL-ARCHITECTURE.md) §8 · [05 Data Model](05-DATA-MODEL.md) §8, §11 · [07 Tests](07-TEST-AND-ACCEPTANCE-PLAN.md) · [09 Security](09-TENANT-ISOLATION-AND-SECURITY.md) |
@@ -252,12 +252,13 @@ Without `LD_LIBRARY_PATH`, `ldd` reports `liburing.so.2 => not found`. That is e
 | Differences from CI | Same PostgreSQL version; Ubuntu instead of Debian build, host glibc. Collation does not depend on glibc (builtin `C.UTF-8` provider). CI on the pinned image stays the authoritative gate |
 | Rollback | `rm -rf ~/.local/opt/postgresql-18.6 ~/.cache/finbot-pgdg` (both directories are created by this plan only). Any leftover test cluster lives in pytest's temp directory under `/tmp/pytest-of-claude/` |
 
-## 7. Known limitations and pending approvals (Step 3B.2)
+## 7. Known limitations and pending approvals (Steps 3B.2–3B.3)
 
 | Item | Status |
 |---|---|
 | Database tests (`tests/integration/test_db_harness.py`, `tests/migration/test_migration_env_db.py`) | **10/10 passed** on the userspace backend (PostgreSQL 18.6, `18.6-1.pgdg24.04+2`), 2026-10-24 (Step 3B.2A), after the strict-mode `pytest_asyncio.fixture` fix in `tests/plugins/db.py`. The container backend has not run |
-| Online migration path (`finbot-migrate upgrade/current`, guard execution in PostgreSQL) | Covered by the passing database tests above (guard refusals, environment-marker check, downgrade refusal and rollback), still with an **empty revision chain** |
+| Online migration path (`finbot-migrate upgrade/current`, guard execution in PostgreSQL) | Covered by the passing database tests above (guard refusals, environment-marker check, downgrade refusal and rollback). Since Step 3B.3 they run the real chain (revision `0001`) |
+| Phase 1 baseline (Step 3B.3, §9) | **49/49 database tests passed** on the userspace backend, 2026-10-24: RLS, privileges, integrity triggers, and the upgrade → downgrade → upgrade lifecycle. Not yet applied to staging (Step 5, `migrate` container) |
 | `liburing2` provenance (§6) | SHA-256 compared and matched; Ubuntu's `InRelease`/`Packages` signature chain **not verified** |
 | CI workflow | Written, **never run** (nothing pushed; D25 open) |
 | Container backend | Unexecuted on this host by design (`claude` has no Docker access) |
@@ -280,3 +281,28 @@ Without `LD_LIBRARY_PATH`, `ldd` reports `liburing.so.2 => not found`. That is e
 | S9 | Downgrades only in dev/test/drill; staging and production use forward fixes (§3.3) |
 | S10 | Application and migration-owner credentials strictly separated (§2) |
 | S11 | The `public` schema is used |
+
+## 9. Phase 1 baseline (revision `0001`, Step 3B.3)
+
+`migrations/versions/0001_phase1_baseline.py` creates exactly the P1 row of doc 05 §11 (S1). Each SQL statement is a separate `op.execute`, and the SQL contains no `%` and no `:name`, so the offline output (`finbot-migrate sql upgrade head`) runs unchanged under psql. The environment marker comes from the validated `FINBOT_ENV` through `migration_runtime.environment_literal()`.
+
+| Area | What `0001` does |
+|---|---|
+| Database and schema | `REVOKE CONNECT, TEMPORARY … FROM PUBLIC`; `CONNECT` for `finbot_app` and `finbot_backup`. `REVOKE ALL ON SCHEMA public FROM PUBLIC`; `USAGE` for the same two roles |
+| Default privileges (owner) | `EXECUTE` on new functions is not granted to `PUBLIC`; `finbot_backup` gets `SELECT` on new tables and sequences. `alembic_version` (created before `0001`) gets an explicit backup grant |
+| Tables | `platform_meta` (+ marker row), `users`, `workspaces`, `workspace_memberships` (no `default_account_id`), `audit_events`, with doc 05's constraints and indexes; `uuidv7()` defaults; `citext` for `users.email` |
+| RLS (D5, S5) | ENABLE + FORCE on the four tenancy tables, policies per doc 09 §4.3, with every context check also requiring an active membership through `app_is_active_member()` (SECURITY DEFINER, boolean only, `EXECUTE` for `finbot_app` only) |
+| App privileges (S7) | `users`: `SELECT`, `UPDATE (display_name, locale, timezone, updated_at)`. `workspaces`: `SELECT, INSERT`, `UPDATE (name, timezone, currency, status, deletion_requested_at, deletion_requested_by, updated_at, version)`. `workspace_memberships`: `SELECT, INSERT`, `UPDATE (role, status, ended_at, version)`. `audit_events`: `SELECT, INSERT`. `platform_meta`: `SELECT`. No `DELETE` or `TRUNCATE` anywhere |
+| Triggers | `trg_personal_membership_is_owner`; `trg_business_has_owner` (deferred constraint trigger); audit append-only on UPDATE, DELETE **and TRUNCATE**, using `session_user` (S6) |
+
+**Interpretations made where the documents leave a choice** (owner review requested):
+
+1. **S5 applies to every context check, including `WITH CHECK`.** As a result, `finbot_app` alone cannot create a business workspace together with its first owner membership: no membership exists yet to satisfy the policy. Phase 2 needs a decision: a narrow `SECURITY DEFINER` creation function (like `redeem_onboarding_invite`) or a documented bootstrap policy.
+2. **Audit inserts also require an active membership** (S5). A `member.left` event must therefore be written before the membership is ended, in the same transaction.
+3. **`finbot_readonly` gets no grants yet.** Break-glass (doc 09 §8) sets only `app.workspace_id`, which S5 policies reject without an active member in `app.user_id`. This conflict must be resolved before break-glass is built.
+4. **`users` has no `INSERT` grant** for the app: users are created by the Phase 2 onboarding definer function.
+5. **Membership columns `invited_by` and `joined_at` are not updatable**, treated as creation metadata like `created_*` (S7).
+6. **`trg_business_has_owner` also fires on `workspaces` INSERT**, so a business workspace cannot be committed without an owner, and it checks every existing business workspace regardless of `status`.
+7. **The two membership trigger functions are `SECURITY DEFINER`** (fixed `search_path`, no `EXECUTE` grants), so their checks see the rows they need whatever the caller's RLS context. The audit trigger function runs as the invoker.
+
+Tests: `tests/integration/test_rls_phase1_db.py` (AT-RLS-00…07, AT-RLS-COVERAGE, S5–S7, integrity triggers), `tests/migration/test_baseline_migration_db.py` (lifecycle), `tests/unit/test_baseline_revision.py` (offline SQL, no database).

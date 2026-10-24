@@ -1,7 +1,7 @@
 """Online migration environment against a real disposable PostgreSQL 18.6 (docs/10 §3, §4).
 
 Runs Alembic online through the repository's env.py, as ``finbot_owner``, on a per-test database:
-the empty chain upgrades cleanly; the guard refuses a wrong database, a wrong role and a
+the repository's chain upgrades cleanly; the guard refuses a wrong database, a wrong role and a
 mismatched environment marker; downgrades are refused without the opt-in and rolled back by the
 single migration transaction. Runs only with FINBOT_TEST_PG_BACKEND set.
 """
@@ -55,7 +55,7 @@ def _run_with(engine: Any, config: Config, fn: Any) -> None:
     asyncio.run(run())
 
 
-def test_empty_chain_upgrade_creates_owner_only_version_table(
+def test_upgrade_creates_owner_only_version_table(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
     command.upgrade(alembic_config, "head")  # online path: env.py creates its own engine

@@ -557,4 +557,6 @@ Reconciliation output (`import_batches.stats`): for each user, rows read, import
 | **P4** | `ai_usage`; receipt extraction columns, if any are deferred from P3 |
 | **P7** | `import_batches` |
 
+The P1 row is implemented by revision `0001` (Step 3B.3); doc 10 §9 lists where it interprets this document.
+
 Role passwords are not set by migrations. They are set from Docker secrets by the database init step (doc 04 §8.2).
