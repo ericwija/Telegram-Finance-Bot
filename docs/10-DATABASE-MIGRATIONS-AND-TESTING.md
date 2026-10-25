@@ -553,7 +553,7 @@ Downgrade (dev/test/drill only) drops the three objects. Tested: populated `0004
 | `WRITE` | `READ COMMITTED` | `users` (own row) `FOR SHARE`, then `workspace_memberships` and `workspaces` `FOR SHARE` | every mutation, conversation step and denial-expiry |
 | `SEED` | `READ COMMITTED` | `users` `FOR SHARE`, then the membership `FOR NO KEY UPDATE` and the workspace `FOR SHARE` | first-use seeding only |
 
-Global order (every code path takes a subset of it, in this order, so no cycle exists): user → membership/workspace → conversation advisory lock (`finbot.conversation:<user>:<ws>`) or category-name advisory lock (`finbot.category-names:<ws>`) → category/account rows (`FOR SHARE` to post, `FOR UPDATE` to change) → transaction row (`FOR UPDATE`) → draft/pending-action row (`FOR UPDATE`). A deadlock or serialization failure (SQLSTATE 40P01/40001) rolls the whole request back and surfaces as `RetryLaterError`; only seeding is retried automatically.
+**Corrected in Step 6C (§14.5):** the global order stated here in Step 6B ("… category/account rows → transaction row → draft row") did not match the code, which locks the draft first. The per-path order actually used, and the order it implies, are in §14.5. A deadlock or serialization failure (SQLSTATE 40P01/40001) rolls the whole request back and surfaces as `RetryLaterError`; only seeding is retried automatically.
 
 ### 13.4 Conversations
 
@@ -571,7 +571,7 @@ G-ENV-2 (database name) → G-ENV-3 (environment marker) → **G-ENV-7 (schema r
 | Gate | Tool and pin | Scope | Fails on |
 |---|---|---|---|
 | Secret detection | gitleaks 8.30.1 (linux x64 tarball, SHA-256 `551f6fc8…70eb` from the release checksums) | whole git history (`fetch-depth: 0`), values redacted in output | any finding |
-| Dependency audit | pip-audit 2.10.1 via `uvx` (PyPI version pin) | `uv export --frozen --all-groups` (hash-pinned requirements; `--require-hashes --disable-pip`, nothing installed) | any known vulnerability (`--strict`) |
+| Dependency audit | pip-audit 2.10.1 (Step 6C: from the hash-pinned `deploy/ci/pip-audit.lock.txt`, §14.7) | `uv export --frozen --all-groups` (hash-pinned requirements; `--require-hashes --disable-pip`, nothing installed) | any known vulnerability (`--strict`) |
 | Lockfile and Dockerfile | Trivy 0.75.0 (tarball SHA-256 `c6e65abd…3f3f`) | `trivy fs` vuln, secret and misconfig, V1 files skipped | High or Critical |
 | Image | Trivy 0.75.0 | the V2 image built in the job from the pinned base (not pushed) | High or Critical, fixed or not (NFR-SEC-06 as approved). An exception needs an owner-approved `.trivyignore` entry with reason and expiry |
 
@@ -589,7 +589,7 @@ ALTER ROLE finbot_app IN DATABASE finbot_staging SET log_error_verbosity = 'ters
 
 Verified on a disposable cluster: `finbot_app` sessions then log errors without DETAIL (the failing row and key values disappear), while `finbot_owner` keeps full detail for migrations and operator work. It takes effect for new connections (restart the bot). Trade-off: less detail when debugging app errors, which the structured application log covers by error type. Alternative (not recommended): `-c log_error_verbosity=terse` for the whole server in `deploy/staging/compose.yml`, which also hides detail from migrations.
 
-### 13.8 Consolidated staging procedure for `0004` + `0005` (operator-only; nothing here has been run)
+### 13.8 Consolidated staging procedure for `0004` + `0005` (operator-only; nothing here has been run; **migrate to `0006`**: see §14.8)
 
 Every step needs owner approval and is run by `deploy` (Docker) or root (secrets) per `deploy/staging/README.md`. `F=deploy/staging/compose.yml`; `owner_psql` is the README §7 helper. Stop at the first unexpected result.
 
@@ -644,6 +644,123 @@ Decisions for the owner (not treated as approved):
 
 1. **§13.7** `log_error_verbosity = terse` for `finbot_app` (R01).
 2. **Trivy strictness:** unfixed High/Critical base-image CVEs fail the image gate as NFR-SEC-06 is written; if that blocks releases, approve either `--ignore-unfixed` or a `.trivyignore` process.
-3. **pip-audit pin:** the tool is pinned by version (PyPI), not by hash; approve, or ask for a hash-pinned tool requirements file.
+3. ~~pip-audit pin~~: resolved in Step 6C (hash-pinned tool lock, §14.7).
 4. **A role change expires the member's open conversation** (R03 design), including a promotion; accept, or ask for promotions to keep it.
 5. **D25** (CI platform), and the open defaults applied in §12.8 (D2, D15, D17, D21, D22), remain open.
+
+
+## 14. Step 6C: release candidate (revision `0006`; second independent review)
+
+The second review of the Step 6B commits found eight findings fixed, four partly fixed (F01, F06, F10, F12) and two new defects (N01, N02). This section records the remaining fixes, the corrected lock order, the migration-compatibility position, and the changes to the operator procedure. **Status: release candidate for independent review. Not deployed; not production-ready by itself** (operator verification, CI on GitHub and owner decisions are outstanding: §14.10).
+
+### 14.1 Resolution
+
+| ID | Remaining defect | Fix | Regression tests |
+|---|---|---|---|
+| F01 | `cancel()` checked only the baseline (`workspace.view`) | Cancelling is validated like continuing: not expired, the conversation's permission now (`transaction.create`/`update` for drafts, `category.manage` for prompts) under the current workspace status overlay, and the current membership version. **Behaviour:** a refused cancel raises Forbidden (audited with the conversation's entity) and the conversation is *invalidated* (`expired`, never `cancelled`); an expired or out-of-epoch one is marked `expired` and cancel returns False; a suspended user is refused before any conversation is read (the draft stays pending and unusable, R-9 then expires it on any use); a removed member gets NotFound | `test_F01_cancel_*` (downgrade, suspension, pending deletion, removal, removal + rejoin, loss of `category.manage`, a concurrent role change proven with a held row lock) |
+| N01 | The denial cleanup expired *whichever* conversation was pending, so a refused old request could expire a newer valid draft | A refusal about a conversation is a `ConversationForbiddenError` that carries that conversation's id; the cleanup runs after the refused transaction rolled back and is a conditional update of exactly that id (`… WHERE id = :id AND status = 'pending'`). Refusals not about a conversation invalidate nothing | `test_N01_*`: request A refused and paused before its cleanup, authorization restored, request B starts a valid draft, A resumes: B stays pending and confirms. Same for category prompts; without a replacement the refused draft is expired |
+| N02 / F10 | `/pengeluaran 25rb kopi → Makanan → Ubah → Kembali ke ringkasan` failed ("Gunakan tombol"): the menu and the summary were the same step | New persisted step `review` (the menu). ✅ is valid on the summary and the menu; ↩️ returns to the summary from the menu, from an unchanged field, or (repeated/stale) from the summary itself; a field button works from the summary or the menu. The draft's pinned account never changes (no account change exists) | domain, Telegram (back from the menu and from each of type/amount/category/description/date; ❌ during an edit; stale menu buttons; a restart between menu presses; the pinned account) |
+| F06 | Paging had an unreachable boundary: more than 2,000 categories produced a Next button the codec refused, hiding `Lainnya` | **Quota** (chosen over keyset paging, which cannot encode the name ordering in 64-byte callbacks): at most **200 categories per workspace and kind**, archived ones included, enforced by the service (under the category-name lock, `category_limit`) **and** by the database (revision `0006`, trigger taking the same advisory lock). The largest listing (both kinds) has 20 pages of 20; `CATEGORY_MAX_PAGES = 20` bounds the codec and a Next button is never emitted towards page 20 | `test_F06_*` (the 200th concurrent create wins once, the 201st is refused by the service and by the database; every page of four listings at full quota, active and archived, both kinds; every emitted button parses; `Lainnya` reachable; the draft's category pages); unit: terminal pages |
+| F12 | No per-request log line; denial entity types partly wrong | Every Telegram finance update logs exactly one `finance.request` line (`outcome` ok/refused/failed, `component` = handler or `button.<action>`, `duration_ms`, `request_id`; never text, amounts or names). Denials are classified by the refused object: `draft` (draft steps, confirm, cancel), `category` (prompts, category operations), `transaction` (edit, void, restore, view) | `test_F12_every_telegram_request_logs_one_line_whose_id_is_on_its_audit_events` (Telegram → log → `audit_events.request_id`, content-free), `test_F12_denials_are_classified_by_the_refused_object` |
+
+The eight findings fixed in Step 6B (F02, F03, F04, F05, F07, F08, F09, F11) keep their regression tests unchanged, and they all pass (§14.9).
+
+### 14.2 Revision `0006_category_quota`
+
+`public.ledger_category_quota()` (`SECURITY DEFINER`, `search_path` pinned, EXECUTE granted to nobody) and `trg_categories_quota BEFORE INSERT ON categories`: takes `pg_advisory_xact_lock(hashtextextended('finbot.category-names:<ws>', 0))` (the application's key; advisory locks are re-entrant within a session), counts the workspace's categories of that kind, and raises `check_violation` "category quota of 200 per kind reached" (no name in the message) at 200. Only INSERT is checked; existing rows are untouched. Downgrade drops both. The bot now requires `0006` (G-ENV-7: `SUPPORTED_SCHEMA_REVISIONS = {"0006"}`), and refuses `0005` with "schema revision is '0005', this release supports 0006". Step 5 and Step 6 images (no G-ENV-7) run on `0006` (additive); the Step 6B image would refuse it, since it supports only `0005` (it was never deployed). Rolling the image back therefore means a Step 5/6 image or a forward fix.
+
+### 14.3 Migration compatibility: drafts from before Step 6B
+
+Conversations written by the Step 6 code (`0411db8`) carry no `membership_version` (and create drafts no `account_id`). **By design they are invalidated, not migrated:** a missing version never equals the current one, so on first use such a draft or prompt is marked `expired` and refused like a stale button, an old confirmed draft is not replayed with details, and nothing is posted. No migration backfills a version: doing so would re-authorize a conversation started under a membership state that can no longer be verified. Tested (`tests/migration/test_historical_drafts_migration_db.py`): Step 6 format drafts and prompts written at `0004`, then upgraded to head; they expire, the 12,000 old draft is never posted, and new conversations work. Staging has never run the Step 6 code, so in practice no such rows exist.
+
+### 14.4 Telegram workflow (as implemented)
+
+```
+summary (confirm) ── ✅ Simpan ─► saved
+   │  └─ ✏️ Ubah ─► menu (review) ─┬─ ↩️ Kembali ─► summary
+   │                                ├─ ✅ (an earlier summary message) ─► saved
+   │                                └─ Jenis/Jumlah/Kategori/Keterangan/Tanggal ─► that step
+   │                                       ├─ a value ─► summary
+   │                                       └─ ↩️ Kembali ─► summary (unchanged)
+   └─ ❌ Batal (at any step, its own conversation only) ─► cancelled
+```
+
+### 14.5 Lock order, per code path (corrected)
+
+| Path | Locks, in acquisition order |
+|---|---|
+| every `WRITE` session | `users` row `FOR SHARE` → membership and workspace rows `FOR SHARE` |
+| `SEED` | `users` `FOR SHARE` → membership `FOR NO KEY UPDATE`, workspace `FOR SHARE` → category-name advisory → category/account inserts (the `0006` trigger re-takes the same advisory lock) → membership update (already held) |
+| start a draft or a prompt | session → conversation advisory → own pending draft/prompt rows (UPDATE to `cancelled`) → INSERT |
+| draft step, confirm of a create draft | session → draft row `FOR UPDATE` → category row `FOR SHARE` → account row `FOR SHARE` → INSERT header, entries, revision, audit |
+| confirm of an edit draft | session → draft row `FOR UPDATE` → transaction row `FOR UPDATE` → category `FOR SHARE` (if changed) → account `FOR SHARE` (if the amount changed) |
+| text answer to a category prompt | session → prompt row `FOR UPDATE` → category-name advisory → category row `FOR UPDATE` (rename) or INSERT (create) |
+| cancel | session → conversation advisory → draft row `FOR UPDATE` → prompt row `FOR UPDATE` |
+| edit, void, restore (`/riwayat`) | session → transaction row `FOR UPDATE` → category `FOR SHARE` → account `FOR SHARE` |
+| create, rename, (de)activate a category | session → category-name advisory → category row `FOR UPDATE` |
+| invalidation after a refusal (N01) | session → conditional UPDATE of one draft or prompt row |
+| `READ` sessions | none |
+
+These are all consistent with one order: **user → membership/workspace → conversation advisory → draft/prompt row → category-name advisory → transaction row → category row → account row**. No path takes a lock that is earlier in this order than one it already holds (the start path updates draft rows after the conversation lock; draft steps never take the conversation lock; no path holds a category or account row and then asks for a transaction, draft, prompt or advisory lock), so these paths cannot deadlock among themselves. Operator SQL outside the application can still deadlock with them; it is then rolled back by PostgreSQL and the request answers "coba lagi".
+
+### 14.6 PostgreSQL log privacy (R01): exact operator command (not applied)
+
+The application path is fixed (§13.1 R01). The remaining exposure, a constraint violation caused by a bug logging the failing row, is closed **only once the operator has applied and verified** this setting. Run once by `deploy` on the VPS, with owner approval, then restart the bot (new connections pick it up):
+
+```bash
+docker exec -i finbot-staging-postgres sh -c \
+  'PGPASSWORD="$(cat /run/secrets/db_superuser_password)" exec psql -X -v ON_ERROR_STOP=1 -h 127.0.0.1 -U postgres -d postgres' <<'SQL'
+ALTER ROLE finbot_app IN DATABASE finbot_staging SET log_error_verbosity = 'terse';
+SELECT d.datname, s.setconfig FROM pg_db_role_setting s
+  JOIN pg_database d ON d.oid = s.setdatabase
+ WHERE s.setrole = 'finbot_app'::regrole;              -- finbot_staging | {log_error_verbosity=terse}
+SQL
+docker compose -f deploy/staging/compose.yml restart bot
+```
+
+Undo: `ALTER ROLE finbot_app IN DATABASE finbot_staging RESET log_error_verbosity;`. The password is read inside the container and never appears in argv or the shell history. Verified on disposable clusters with synthetic data: the setting makes `finbot_app` sessions report `terse` while `finbot_owner` keeps `default` (`test_R01_terse_error_verbosity_for_the_app_role_only`, both backends), and on a user-space cluster the failing row and key values disappear from the server log for the app role (Step 6B scratch investigation). A database restore (§12.2) recreates `finbot_staging`, which drops this per-database setting: re-apply it after any restore.
+
+### 14.7 Security gates: review and local results (2026-10-25)
+
+| Check | Result |
+|---|---|
+| Workflow syntax | actionlint 1.7.12 (checksum-verified): no findings (shellcheck integration not available locally) |
+| Permissions and secrets | workflow-level `permissions: contents: read`; `persist-credentials: false`; no `secrets.*` and no `pull_request_target`; nothing is pushed (the image is built and scanned locally in the runner only) |
+| Binary integrity | uv, gitleaks and Trivy tarballs verified with `sha256sum --check --strict` against the vendors' release checksums before extraction |
+| pip-audit reproducibility | **Changed:** pip-audit and its 27 dependencies are installed from the committed, hash-pinned `deploy/ci/pip-audit.lock.txt` (`--require-hashes --no-deps`), and that lock is audited too. A two-week release-age cutoff was tried and rejected: it resolved certifi/filelock versions with 7 known vulnerabilities. Local: both the project lock (485 lines) and the tool lock: no known vulnerabilities |
+| gitleaks | V2 paths: clean. **Whole history (as CI runs it): 1 finding**, rule `generic-api-key` in V1's `.env.example`, line 16, introduced by `b681dbf` ("Initial commit", 2025-12-10); fingerprint `b681dbf63a99f014232aa0756450f5adc3a56fca:.env.example:generic-api-key:16`. The value was not viewed (redacted). **The CI `security` job and `make security` therefore fail until the owner triages it** (owner decision §14.10): if it is a placeholder, add that fingerprint to `.gitleaksignore` with the reason; if it was ever a real key, rotate it (history is not rewritten). V1 is not modified either way |
+| Trivy fs | repository root with the CI flags (V1 files skipped): 0 High/Critical in `uv.lock`, 0 Dockerfile misconfigurations |
+| Trivy image | **Not run anywhere** (the image has never been built; `claude` has no Docker) |
+| CI on GitHub | **Not run** (nothing pushed) |
+
+### 14.8 Changes to the operator procedure (§13.8)
+
+Migrate to **`0006`** instead of `0005`: review `migrate sql upgrade 0003:0006`; apply `migrate upgrade 0006`; `current` must print `0006`; a bot on `0005` refuses with "this release supports 0006". Add to the verification (§13.9):
+
+```sql
+SELECT version_num FROM public.alembic_version;                                     -- 0006
+SELECT tgname, tgenabled FROM pg_trigger WHERE tgname = 'trg_categories_quota';      -- trg_categories_quota | O
+SELECT p.prosecdef, has_function_privilege('finbot_app', p.oid, 'EXECUTE'),
+       has_function_privilege('public', p.oid, 'EXECUTE')
+FROM pg_proc p WHERE p.proname = 'ledger_category_quota';                            -- t | f | f
+```
+
+Add to the smoke test: `/pengeluaran 25rb kopi` → Makanan → ✏️ Ubah → ↩️ Kembali ke ringkasan → ✅ (N02); start a draft, then press ❌ on an older conversation (nothing cancelled). After any restore, re-apply §14.6 if it was approved.
+
+### 14.9 Tests
+
+| Gate | Result (2026-10-25) |
+|---|---|
+| `make check` (ruff, mypy strict, import-linter, unit tests) | 730 passed, 0 failed, 219 skipped (the database tests); coverage 87.9 %; 4 contracts kept |
+| `make test-db` (PostgreSQL 18.6 user-space) | 219 executed, 219 passed, 0 skipped |
+| Concurrency files repeated (§14.1 tests and the Step 6B ones) | see the release report; any failure would have been reported |
+
+New in Step 6C: `tests/integration/test_finance_release_db.py` (18), `tests/migration/test_historical_drafts_migration_db.py` (1), schema-guard cases for `0005` → `0006`, unit tests for the review step, terminal pages and the `0006` SQL, and Telegram tests for every navigation path.
+
+### 14.10 Status, deferred scope and owner decisions
+
+- **Implemented and verified locally:** §12, §13.1 and §14.1, by the tests in §14.9.
+- **Unverified:** behaviour on staging; the CI workflow on GitHub; the image scan; a real staging backup restore; the R01 setting on the staging server.
+- **Operator-only:** §13.8 with §14.8; §14.6 if approved.
+- **Deferred roadmap (not built):** workspace switching (`/ruang`), account management, transfers and therefore changing a draft's account, free-text capture and the parser, undo, type change of posted transactions (D21), revision history view, 6-month comparison, CSV export, `/audit`, expiry and prune jobs, `security.cross_tenant_probe`, member notifications.
+- **Owner decisions:** (1) the gitleaks finding in V1 history (§14.7); (2) the category quota of 200 per kind (archived included); (3) §14.6 for staging; (4) Trivy strictness on unfixed base-image CVEs; (5) a role change (including a promotion) ends the member's open conversation; (6) a refused cancel *invalidates* the conversation (status `expired`) rather than cancelling it; (7) old pre-6B conversations are invalidated, not migrated; (8) D25 and the open defaults D2, D15, D17, D21, D22.

@@ -262,7 +262,7 @@ Replies are HTML with every interpolated value escaped, and link previews off. T
  "✅ Tersimpan …" (the same message is edited, so its buttons disappear)
 ```
 
-Step 6B: a ❌ cancels only its own conversation (draft or category prompt); conversations record the membership version and the resolved account; expiry is persisted before the refusal; a replayed ✅ is re-authorized (doc 10 §13.4).
+Step 6B: a ❌ cancels only its own conversation (draft or category prompt); conversations record the membership version and the resolved account; expiry is persisted before the refusal; a replayed ✅ is re-authorized (doc 10 §13.4). Step 6C: ✏️ Ubah opens a persisted field menu (`review` step) from which ↩️ returns to the summary; cancelling is authorized like continuing; a refusal invalidates only the refused conversation; every request logs one content-free `finance.request` line with its request id; category lists are bounded by a quota of 200 per kind (doc 10 §14).
 
 `/pengeluaran 25rb makan siang` fills the amount and description and goes straight to the category step. `/riwayat` lists ten transactions per page with number buttons. Each detail offers ✏️ Ubah (amount, category, description, date; an edit draft with its own confirmation), 🗑️ Hapus (with a confirmation) and ♻️ Pulihkan, each only if the caller's role allows it. `/kategori` lists categories and offers create, rename (pending action plus a typed name) and activate/deactivate. `/saldo` shows recorded balances per account, labelled as not being a bank statement; `/laporan [bulan]` shows a monthly summary.
 

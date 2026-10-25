@@ -200,6 +200,11 @@
 - FR-CAT-02/04: category lists are paged, so every category (including `Lainnya`) is reachable; deactivated categories are listed with `nonaktif` and can be reactivated.
 - Amounts in commands keep separated units: `/pengeluaran 2 juta sewa` is Rp 2.000.000 with the description "sewa"; an ambiguous amount (`2 jutaan`) is asked again.
 
+**Step 6C status (release candidate, doc 10 §14).**
+- FR-TXN-05: ✏️ Ubah opens a field menu; ↩️ Kembali ke ringkasan returns to the confirmation from the menu or from any field left unchanged; ✅ stays valid. The account is still not changeable (deferred with FR-ACC-01).
+- FR-CAT-02: at most **200 categories per workspace and kind**, archived ones included (owner decision pending on the number); the 201st is refused ("Batas 200 kategori …"). Every category page is reachable and `Lainnya` is always listed.
+- ❌ and `/batal` are refused (and the conversation invalidated) when the member no longer holds the conversation's permission.
+
 ## 13. Open items specific to this document
 
 - **O-1**: Should business workspaces be seeded with business categories (Penjualan, Bahan Baku, Gaji Karyawan, Sewa, Operasional, Marketing)? Proposed: yes.

@@ -268,8 +268,8 @@ the bot does not depend on it. The bot simply refuses to start (G-ENV-3 or G-ENV
 while the schema is missing or not at the revision the image supports. Downgrades are refused in
 staging (S9); recovery is a restore (§12.2).
 
-**The current V2 image (Step 6B) requires revision `0005`.** After §7 (up to `0003`), apply
-`0004` and `0005` with §7A before §9; a bot started on `0003` or `0004` exits with
+**The current V2 image (Step 6C) requires revision `0006`.** After §7 (up to `0003`), apply
+`0004`–`0006` with §7A before §9; a bot started on `0003`, `0004` or `0005` exits with
 `refused: database schema revision …` (G-ENV-7) without polling.
 
 Helper used below. It runs read-only checks as `finbot_owner` inside the postgres container;
@@ -347,26 +347,28 @@ SQL
 
 If any check differs, do not start the bot. Record the outcome in the deployment log.
 
-## 7A. Migrations 0004–0005: ledger core and schema guard (operator-controlled, owner approval)
+## 7A. Migrations 0004–0006: ledger core, schema guard, category quota (operator-controlled, owner approval)
 
 The complete, ordered procedure (predeployment checks, image provenance, backup and its
 validation, an isolated restore rehearsal, SQL review, controlled bot stop, migration,
-verification, start, Telegram smoke tests, rollback and forward-fix decisions) is doc 10 §13.8,
-with the verification queries in doc 10 §12.5 and §13.9. The commands specific to it:
+verification, start, Telegram smoke tests, rollback and forward-fix decisions) is doc 10 §13.8
+as amended by §14.8, with the verification queries in doc 10 §12.5, §13.9 and §14.8. The
+commands specific to it:
 
 ```bash
 docker compose -f $F run --rm migrate current      # 0003 (else: §7 first)
-docker compose -f $F run --rm --no-deps migrate sql upgrade 0003:0005 \
-  > ~/finbot-staging-migrations/upgrade_0003_0005_$REV.sql     # review; no credentials inside
+docker compose -f $F run --rm --no-deps migrate sql upgrade 0003:0006 \
+  > ~/finbot-staging-migrations/upgrade_0003_0006_$REV.sql     # review; no credentials inside
 # backup (§12.1), validate it (pg_restore --list), rehearse a restore elsewhere (doc 10 §13.8 step 5)
 docker compose -f $F stop bot                      # if a bot is running
-docker compose -f $F run --rm migrate upgrade 0005; echo "exit $?"   # one transaction
-docker compose -f $F run --rm migrate current      # 0005
+docker compose -f $F run --rm migrate upgrade 0006; echo "exit $?"   # one transaction
+docker compose -f $F run --rm migrate current      # 0006
 ```
 
 Never `downgrade` or `stamp` in staging. A non-zero exit applied nothing; fix and re-run.
-Optional and separately approved: doc 10 §13.7 (`log_error_verbosity = 'terse'` for
-`finbot_app`, so constraint errors do not log row contents).
+Optional and separately approved: doc 10 §14.6 (`log_error_verbosity = 'terse'` for
+`finbot_app`, so constraint errors do not log row contents; the exact command, its
+verification and undo are there). Re-apply it after any §12.2 restore.
 
 ## 8. Bootstrap the first platform admin (once, owner approval)
 
@@ -393,7 +395,7 @@ SQL
 ## 9. Start the bot (owner approval)
 
 Preconditions: §2.2 token file, §2.3 identity file, §6 image, §7.4 verified, **§7A applied
-(`current` = `0005`)**. §8 is needed before any invite can be created.
+(`current` = `0006`)**. §8 is needed before any invite can be created.
 
 ### 9.1 Preflight (offline: no Telegram, no polling, no database connection)
 
@@ -429,7 +431,7 @@ unless-stopped` then retries with Docker's backoff, so fix the cause and `up -d 
 |---|---|---|
 | `G-ENV-2` | connected to another database | `FINBOT_DB_NAME` / `FINBOT_DB_HOST` in compose |
 | `G-ENV-3` or `database environment check failed` | schema missing (§7 not done) or wrong marker | run §7; never edit the marker |
-| `G-ENV-7` / `database schema revision` | the schema is not at the revision this image supports (`0005`), e.g. §7A not done, or an older/newer image | run §7A, or deploy the image matching the schema; never migrate from the bot |
+| `G-ENV-7` / `database schema revision` | the schema is not at the revision this image supports (`0006`), e.g. §7A not done, or an older/newer image | run §7A, or deploy the image matching the schema; never migrate from the bot |
 | `poller lock held` | another bot process for staging is running | find and stop it (`docker ps`); never work around the lock |
 | `G-ENV-4` | the token belongs to another bot than `bot-identity.env` names | §2.2 / §2.3 |
 | `Telegram getMe failed (InvalidToken)` | token revoked or mistyped | §2.2 |
@@ -562,7 +564,7 @@ the volume, the roles and every other database stay.
 | Bot misbehaves | `stop bot` (V1 unaffected). If the token may have leaked, revoke it in @BotFather and rotate it (§13) |
 | Bad app image | `docker tag finbot-v2:staging-<previous sha> finbot-v2:staging && docker compose -f $F up -d bot`. Only if that code supports the current schema (expand/contract) |
 | `migrate upgrade` exited non-zero | Nothing was applied (one transaction). `current` confirms; fix and re-run §7.3 / §7A |
-| Step 6B image misbehaves after `0005` | Retag the previous image: Step 5/6 images run on `0005` (additive revisions); the schema stays |
+| Step 6C image misbehaves after `0006` | Retag the previous image: older images run on `0006` (additive revisions); the schema stays. Note a Step 6B image refuses `0006` (it supports only `0005`), so roll back to a Step 5/6 image or forward-fix |
 | A migration applied but is wrong | Forward-fix revision (reviewed), or §12.2 with the pre-migration backup. Never `downgrade` or `stamp` (refused in staging) |
 | Wrong admin bootstrapped | The marker is permanent: §12.2 with the pre-bootstrap backup (or empty + §7), then §8 again |
 | Bring-up fails before any data exists | `down`, then `docker volume rm finbot-staging_pgdata` (this volume only, owner approval), fix, start again |
