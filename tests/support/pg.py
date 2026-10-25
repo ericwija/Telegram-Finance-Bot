@@ -48,6 +48,15 @@ SECRET_NAMES = {
 }
 CONTAINER_PGDATA = "/var/lib/postgresql/18/docker"
 CONTAINER_MARKER = "/var/lib/postgresql/18/finbot-init.done"
+#: Run with `docker exec` as the container user. `-U`/`-d` are required, as in the staging
+#: healthcheck: the container runs as the runner's uid, which has no passwd entry in the image,
+#: so libpq cannot derive a default user name and pg_isready would exit 3 ("no attempt")
+#: without ever contacting the server. Exit 10 means 00-roles.sh has not written its marker.
+CONTAINER_READY_CHECK = (
+    f"if [ ! -f {CONTAINER_MARKER} ]; then echo 'init marker missing'; exit 10; fi; "
+    f"exec pg_isready -h 127.0.0.1 -p 5432 -d postgres -U {SUPERUSER}"
+)
+_LOG_TAIL_LINES = 40
 _MAX_SOCKET_DIR = 90  # Unix socket paths are limited to 107 bytes including the file name
 
 #: Same as POSTGRES_INITDB_ARGS in deploy/staging/compose.yml (tests/unit/test_pg_support.py).
@@ -331,14 +340,46 @@ class ContainerCluster:
         return ClusterInfo("container", host, port, secrets_dir)
 
     def _wait_until_initialised(self, timeout: float = 120.0) -> None:
+        """Wait for the init marker and a TCP-ready server; fail fast if the container exits."""
+        from docker.errors import APIError  # noqa: PLC0415
+
         deadline = time.monotonic() + timeout
-        check = f"test -f {CONTAINER_MARKER} && pg_isready -h 127.0.0.1 -p 5432 -q"
+        last = "no readiness check completed"
         while time.monotonic() < deadline:
-            result = self.container.exec(["sh", "-c", check])
-            if result.exit_code == 0:
-                return
+            wrapped = self.container.get_wrapped_container()
+            wrapped.reload()
+            if wrapped.status != "running":
+                raise ClusterError(
+                    self._diagnostics(f"test container is {wrapped.status} during start-up", last)
+                )
+            try:
+                result = self.container.exec(["sh", "-c", CONTAINER_READY_CHECK])
+            except APIError as exc:  # e.g. the container exited between reload() and exec
+                last = f"exec failed: {exc.explanation or exc}"
+            else:
+                if result.exit_code == 0:
+                    return
+                output = result.output.decode("utf-8", "replace").strip() or "(no output)"
+                last = f"exit {result.exit_code}: {output}"
             time.sleep(1)
-        raise ClusterError("test container did not finish initialisation in time")
+        raise ClusterError(
+            self._diagnostics(
+                f"test container did not finish initialisation in {timeout:.0f}s", last
+            )
+        )
+
+    def _diagnostics(self, problem: str, last_check: str) -> str:
+        """The problem, the last readiness result and the container log tail (no secrets:
+        passwords are only in files, and 00-roles.sh disables statement logging)."""
+        try:
+            raw = self.container.get_wrapped_container().logs(tail=_LOG_TAIL_LINES)
+            logs = raw.decode("utf-8", "replace").rstrip() or "(empty)"
+        except Exception as exc:  # noqa: BLE001 - diagnostics must never hide the real error
+            logs = f"(container logs unavailable: {type(exc).__name__})"
+        return (
+            f"{problem}\nlast readiness check: {last_check}\n"
+            f"container log (last {_LOG_TAIL_LINES} lines):\n{logs}"
+        )
 
     def stop(self) -> None:
         if self.container is not None:

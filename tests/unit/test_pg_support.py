@@ -2,7 +2,10 @@
 
 import re
 import stat
+import subprocess
 from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 
 import pytest
 
@@ -109,3 +112,94 @@ def test_server_args_put_hba_first_and_include_test_only_settings() -> None:
 def test_unknown_backend_rejected(tmp_path: Path) -> None:
     with pytest.raises(pg.ClusterError, match="unknown"):
         pg.make_cluster("staging", tmp_path)
+
+
+# ------------------------------------------------- container readiness (no Docker needed)
+
+
+class _FakeWrapped:
+    def __init__(self, statuses: list[str]) -> None:
+        self._statuses = statuses
+        self.status = "created"
+
+    def reload(self) -> None:
+        self.status = self._statuses.pop(0) if len(self._statuses) > 1 else self._statuses[0]
+
+    def logs(self, *, tail: int) -> bytes:
+        assert tail == 40
+        return b"initdb: error: example failure\n"
+
+
+class _FakeContainer:
+    def __init__(self, statuses: list[str], results: list[tuple[int, bytes]]) -> None:
+        self.wrapped = _FakeWrapped(statuses)
+        self.results = results
+        self.commands: list[list[str]] = []
+
+    def get_wrapped_container(self) -> _FakeWrapped:
+        return self.wrapped
+
+    def exec(self, command: list[str]) -> Any:
+        self.commands.append(command)
+        code, output = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        return SimpleNamespace(exit_code=code, output=output)
+
+
+def _waiting_cluster(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, container: _FakeContainer
+) -> pg.ContainerCluster:
+    monkeypatch.setattr(pg.time, "sleep", lambda _s: None)
+    cluster = pg.ContainerCluster(tmp_path / "c")
+    cluster.container = container
+    return cluster
+
+
+def test_container_ready_check_names_the_user_like_the_staging_healthcheck() -> None:
+    staging = re.search(r"pg_isready (-h .+)$", COMPOSE_TEXT, re.M)
+    assert staging
+    # The runner uid has no passwd entry in the image: without -U, pg_isready never connects.
+    assert f"-U {pg.SUPERUSER}" in pg.CONTAINER_READY_CHECK
+    assert f"-U {pg.SUPERUSER}" in staging.group(1)
+    assert "pg_isready -h 127.0.0.1 -p 5432 -d postgres -U postgres" in pg.CONTAINER_READY_CHECK
+
+
+def test_container_ready_check_reports_a_missing_marker() -> None:
+    assert not Path(pg.CONTAINER_MARKER).exists()
+    result = subprocess.run(
+        ["sh", "-c", pg.CONTAINER_READY_CHECK], capture_output=True, text=True, check=False
+    )
+    assert (result.returncode, result.stdout.strip()) == (10, "init marker missing")
+
+
+def test_container_wait_returns_once_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    container = _FakeContainer(["running"], [(10, b"init marker missing"), (0, b"accepting")])
+    _waiting_cluster(tmp_path, monkeypatch, container)._wait_until_initialised(timeout=5)
+    assert container.commands == [["sh", "-c", pg.CONTAINER_READY_CHECK]] * 2
+
+
+def test_container_exit_fails_fast_with_logs(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    container = _FakeContainer(["running", "exited"], [(10, b"init marker missing")])
+    cluster = _waiting_cluster(tmp_path, monkeypatch, container)
+    with pytest.raises(pg.ClusterError) as excinfo:
+        cluster._wait_until_initialised(timeout=60)
+    message = str(excinfo.value)
+    assert "test container is exited during start-up" in message
+    assert "last readiness check: exit 10: init marker missing" in message
+    assert "initdb: error: example failure" in message
+
+
+def test_container_timeout_reports_the_last_readiness_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    clock = iter(range(0, 1000, 10))
+    monkeypatch.setattr(pg.time, "monotonic", lambda: float(next(clock)))
+    container = _FakeContainer(["running"], [(3, b"127.0.0.1:5432 - no attempt")])
+    cluster = _waiting_cluster(tmp_path, monkeypatch, container)
+    with pytest.raises(pg.ClusterError) as excinfo:
+        cluster._wait_until_initialised(timeout=30)
+    message = str(excinfo.value)
+    assert "did not finish initialisation in 30s" in message
+    assert "last readiness check: exit 3: 127.0.0.1:5432 - no attempt" in message
+    assert "container log (last 40 lines):" in message
