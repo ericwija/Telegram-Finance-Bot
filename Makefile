@@ -37,15 +37,17 @@ migrate-sql:
 	uv run finbot-migrate sql upgrade head
 
 # Security gates as in CI (.github/workflows/ci.yml, job "security"), without the image build
-# and image scan (they need Docker). Requires gitleaks and trivy on PATH or GITLEAKS=/TRIVY=;
-# pip-audit runs through uvx. Fails on any finding.
+# and image scan (they need Docker). Requires gitleaks and trivy on PATH or GITLEAKS=/TRIVY=,
+# and PIP_AUDIT= a pip-audit installed from deploy/ci/pip-audit.lock.txt (--require-hashes).
+# Fails on any finding.
 GITLEAKS ?= gitleaks
 TRIVY ?= trivy
-PIP_AUDIT_VERSION ?= 2.10.1
+PIP_AUDIT ?= pip-audit
 security:
 	$(GITLEAKS) git --redact --no-banner --exit-code 1 .
 	uv export --frozen --all-groups --no-emit-project --format requirements-txt -o .security-requirements.txt
-	uvx --from "pip-audit==$(PIP_AUDIT_VERSION)" pip-audit --strict --disable-pip --require-hashes \
-		-r .security-requirements.txt --progress-spinner off; status=$$?; rm -f .security-requirements.txt; exit $$status
+	$(PIP_AUDIT) --strict --disable-pip --require-hashes -r .security-requirements.txt \
+		--progress-spinner off; status=$$?; rm -f .security-requirements.txt; exit $$status
+	$(PIP_AUDIT) --strict --disable-pip --require-hashes -r deploy/ci/pip-audit.lock.txt --progress-spinner off
 	$(TRIVY) fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 \
 		--skip-files main.py,requirements.txt,Dockerfile,docker-compose.yml .

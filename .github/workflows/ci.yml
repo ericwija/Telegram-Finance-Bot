@@ -8,8 +8,10 @@
 # - Security gates (NFR-SEC-04, NFR-SEC-06, docs/09 §9; docs/10 §13.6): gitleaks over the whole
 #   history, pip-audit over the locked dependency set, Trivy over the lockfile, the Dockerfile and
 #   the built V2 image. Any finding fails the job (Trivy: High or Critical). The scanners are
-#   pinned binaries (version + SHA-256 from the vendor's release checksums) or a pinned PyPI
-#   version; they need no secrets and no external service beyond their public databases.
+#   pinned binaries (version + SHA-256 from the vendor's release checksums); pip-audit and its
+#   dependencies come from the hash-pinned deploy/ci/pip-audit.lock.txt. They need no secrets and
+#   no external service beyond their public databases. gitleaks also scans the V1 history (read
+#   only); a finding there is triaged by the owner (docs/10 §14.7), never silenced here.
 # V1 (main.py, requirements.txt) is not built or tested here.
 
 name: ci
@@ -31,7 +33,6 @@ env:
   GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
   TRIVY_VERSION: "0.75.0"
   TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
-  PIP_AUDIT_VERSION: "2.10.1"
   UV_VERSION: "0.12.23"
   UV_SHA256: "9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6"
   UV_PYTHON_PREFERENCE: only-managed
@@ -131,12 +132,16 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: Secret detection (gitleaks, whole history, values redacted)
         run: gitleaks git --redact --no-banner --exit-code 1 .
-      - name: Python dependency audit (pip-audit over uv.lock, hashes required)
+      - name: Python dependency audit (pip-audit from a hash-pinned lock; audits uv.lock and itself)
         run: |
           set -euo pipefail
+          uv python install 3.13
+          uv venv /tmp/pip-audit --python 3.13
+          uv pip install --python /tmp/pip-audit --require-hashes --no-deps -r deploy/ci/pip-audit.lock.txt
           uv export --frozen --all-groups --no-emit-project --format requirements-txt -o /tmp/requirements.txt
-          uvx --from "pip-audit==${PIP_AUDIT_VERSION}" pip-audit --strict --disable-pip \
-            --require-hashes -r /tmp/requirements.txt --progress-spinner off
+          for lock in /tmp/requirements.txt deploy/ci/pip-audit.lock.txt; do
+            /tmp/pip-audit/bin/pip-audit --strict --disable-pip --require-hashes -r "$lock" --progress-spinner off
+          done
       - name: Lockfile and Dockerfile scan (Trivy, High/Critical fail)
         run: |
           trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 \

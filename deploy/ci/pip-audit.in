@@ -1,0 +1,7 @@
+# The pip-audit tool used by the CI job "security" (docs/10 §14.7). Locked with hashes:
+#   uv pip compile deploy/ci/pip-audit.in --generate-hashes --python-version 3.13 \
+#     --python-platform x86_64-unknown-linux-gnu -o deploy/ci/pip-audit.lock.txt
+# CI installs it with --require-hashes --no-deps and audits this lock too. No release-age
+# cutoff: a two-week cutoff (2026-10-11) resolved certifi and filelock versions with 7 known
+# vulnerabilities, whose fixes are newer (Step 6C).
+pip-audit==2.10.1
