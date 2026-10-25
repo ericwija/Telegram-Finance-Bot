@@ -205,8 +205,13 @@ def test_F10_every_correction_returns_to_the_complete_confirmation() -> None:
     assert state.revise(DraftField.DATE).back() == state
     assert income.account_id == account  # the resolved account never changes
     assert draft_state(income.to_json()) == income
-    with pytest.raises(StepError):
-        state.back()  # nothing to go back from
+    assert state.back() == state  # a repeated or stale ↩️ changes nothing
+    menu = state.review()
+    assert menu.step is CaptureStep.REVIEW
+    assert not menu.revising  # the menu is open, no field is being edited (N02)
+    assert menu.back() == state  # ↩️ straight from the menu
+    assert menu.complete() == state.complete()  # ✅ stays valid while the menu is shown
+    assert menu.revise(DraftField.AMOUNT).back() == state
     with pytest.raises(StepError):
         CaptureState.start(TODAY, TxnType.EXPENSE).back()  # incomplete: no summary yet
     with pytest.raises(StepError):

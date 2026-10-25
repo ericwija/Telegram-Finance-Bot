@@ -12,6 +12,7 @@ from finbot.adapters.telegram.finance import COMMANDS, error_text, history_filte
 from finbot.authz.permissions import Permission
 from finbot.authz.policy import ForbiddenError
 from finbot.domain.finance import (
+    CATEGORY_MAX_PAGES,
     CATEGORY_PAGE_SIZE,
     Account,
     CaptureState,
@@ -77,7 +78,7 @@ def test_every_callback_round_trips_and_fits_64_bytes() -> None:
         cb.draft_type(ref, TxnType.EXPENSE),
         cb.draft_category(ref, CAT),
         cb.draft_skip(ref),
-        cb.draft_category_page(ref, 99),
+        cb.draft_category_page(ref, CATEGORY_MAX_PAGES - 1),
         cb.draft_review(ref),
         *(cb.draft_revise(ref, f) for f in DraftField),
         cb.draft_back(ref),
@@ -92,7 +93,7 @@ def test_every_callback_round_trips_and_fits_64_bytes() -> None:
         cb.delete_yes(TXN, 2),
         cb.restore(TXN, 2),
         cb.category_list(None),
-        cb.category_list(TxnType.INCOME, 99, archived=True),
+        cb.category_list(TxnType.INCOME, CATEGORY_MAX_PAGES - 1, archived=True),
         cb.category_detail(CAT),
         cb.category_new(TxnType.EXPENSE),
         cb.category_rename(CAT),
@@ -135,8 +136,8 @@ def test_every_callback_round_trips_and_fits_64_bytes() -> None:
         f"f:ef:z:{TXN}:1",
         "f:dt:deadbeef",  # the old date button: now refused as stale
         "f:kl:e",  # the old one-field category list
-        "f:kl:e:100:0",  # beyond the last category page
-        "f:cp:deadbeef:100",
+        f"f:kl:e:{CATEGORY_MAX_PAGES}:0",  # beyond the last category page
+        f"f:cp:deadbeef:{CATEGORY_MAX_PAGES}",
         "f:uf:deadbeef:z",
         "f:" + "a" * 70,
     ],
@@ -371,3 +372,20 @@ def test_documented_and_requested_command_names() -> None:
     names = {name for group in COMMANDS for name in group}
     assert {"catat", "riwayat", "laporan", "saldo", "kategori", "bantuan"} <= names  # docs/02 §12
     assert {"tambah", "pemasukan", "pengeluaran", "transaksi", "ringkasan"} <= names  # Step 6
+
+
+@pytest.mark.parametrize("page", [0, 1, CATEGORY_MAX_PAGES - 2, CATEGORY_MAX_PAGES - 1])
+def test_F06_every_emitted_category_callback_is_accepted_and_never_past_the_end(page: int) -> None:
+    listing = CategoryListing(WS, _categories(CATEGORY_PAGE_SIZE), True, None, False, page, True)
+    draft = DraftView(
+        uuid.uuid4(), "deadbeef",
+        CaptureState(CaptureStep.CATEGORY, date(2026, 10, 25), TxnType.EXPENSE, 1),
+        "Pribadi", "personal", "IDR",
+        categories=_categories(CATEGORY_PAGE_SIZE), category_page=page, categories_has_next=True,
+    )  # fmt: skip
+    for text, keyboard in (render.render_categories(listing), render.render_draft(draft)):
+        parsed = [cb.parse(data) for row in keyboard for _, data in row]  # never raises
+        assert all(c.page < CATEGORY_MAX_PAGES for c in parsed if c.action in ("kl", "cp"))
+        labels = [label for row in keyboard for label, _ in row]
+        assert (msg.BUTTON_NEXT in labels) is (page < CATEGORY_MAX_PAGES - 1)
+        assert render.fits_telegram(text, keyboard)

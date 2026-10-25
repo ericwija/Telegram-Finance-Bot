@@ -156,8 +156,8 @@ class FakeSession:
     async def lock_category_names(self) -> None:
         return None
 
-    async def count_categories(self) -> int:
-        return len(self._mine(self.st.categories))
+    async def count_categories(self, kind: TxnType | None = None) -> int:
+        return sum(kind is None or c["kind"] is kind for c in self._mine(self.st.categories))
 
     async def list_categories(
         self,
@@ -467,6 +467,20 @@ class FakeSession:
 
     async def set_pending_action_status(self, action_id: uuid.UUID, status: str) -> None:
         self.st.actions[action_id]["status"] = status
+
+    async def expire_draft_if_pending(self, draft_id: uuid.UUID) -> bool:
+        draft = next((d for d in self._my_drafts() if d["id"] == draft_id), None)
+        if draft is None or draft["status"] is not DraftStatus.PENDING:
+            return False
+        draft["status"] = DraftStatus.EXPIRED
+        return True
+
+    async def expire_action_if_pending(self, action_id: uuid.UUID) -> bool:
+        action = next((a for a in self._my_actions() if a["id"] == action_id), None)
+        if action is None or action["status"] != "pending":
+            return False
+        action["status"] = "expired"
+        return True
 
     # reports
     def _posted(self) -> list[dict[str, Any]]:

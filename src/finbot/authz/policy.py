@@ -130,13 +130,23 @@ _READ_ONLY_OWNER_EXTRA: Final = frozenset({P.WORKSPACE_CANCEL_DELETION, P.REPORT
 
 
 class ForbiddenError(PermissionError):
-    """Denied inside the caller's own workspace (G-4). ``reason`` is for logs and audit only."""
+    """Denied inside the caller's own workspace (G-4). ``reason`` is for logs and audit only;
+    ``entity`` (``draft``, ``category``, ``transaction``) classifies the audited denial when the
+    refused object is known more precisely than by the operation."""
 
-    def __init__(self, permission: Permission, reason: str, role: str | None = None) -> None:
+    def __init__(
+        self,
+        permission: Permission,
+        reason: str,
+        role: str | None = None,
+        *,
+        entity: str | None = None,
+    ) -> None:
         super().__init__(f"{permission.value}: {reason}")
         self.permission = permission
         self.reason = reason
         self.role = role
+        self.entity = entity
 
 
 def allowed(ctx: WorkspaceContext, permission: Permission) -> bool:

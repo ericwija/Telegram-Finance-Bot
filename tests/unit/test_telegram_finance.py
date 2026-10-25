@@ -428,3 +428,69 @@ async def test_retry_later_is_answered_and_nothing_is_stored(
     monkeypatch.setattr(bot.services.finance.capture, "start", busy)  # type: ignore[union-attr]
     text, _ = await bot.send("/pengeluaran 5rb")
     assert text == msg.BUSY
+
+
+# ------------------------------------------------------------------- Step 6C regressions
+
+
+async def _summary(bot: Bot) -> Buttons:
+    _, buttons = await bot.send("/pengeluaran 25rb kopi")
+    text, buttons = await bot.press(button(buttons, "Makanan"))
+    assert msg.ASK_CONFIRM in text
+    return buttons
+
+
+async def test_N02_ubah_then_back_returns_to_a_valid_summary(bot: Bot) -> None:
+    summary = await _summary(bot)
+    text, menu = await bot.press(button(summary, msg.BUTTON_EDIT))
+    assert msg.ASK_REVISE in text
+    text, buttons = await bot.press(button(menu, msg.BUTTON_BACK_TO_SUMMARY))
+    assert msg.ASK_CONFIRM in text  # the exact flow the audit reported as broken
+    assert "<b>Rp 25.000</b>" in text
+    assert "Keterangan: kopi" in text
+    text, _ = await bot.press(button(buttons, msg.BUTTON_SAVE))
+    assert text.startswith("✅ Tersimpan: ⬇️ Pengeluaran Rp 25.000 — Makanan")
+
+
+@pytest.mark.parametrize("field", ["amount", "category", "description", "date", "type"])
+async def test_N02_every_field_can_be_left_unchanged(bot: Bot, field: str) -> None:
+    summary = await _summary(bot)
+    before = next(iter(bot.store.state.drafts.values()))["proposal"]
+    _, menu = await bot.press(button(summary, msg.BUTTON_EDIT))
+    text, buttons = await bot.press(button(menu, msg.EDIT_FIELD_LABEL[field]))
+    if field == "type":  # the type step: the same type keeps everything
+        text, buttons = await bot.press(button(buttons, msg.BUTTON_EXPENSE))
+    else:
+        text, buttons = await bot.press(button(buttons, msg.BUTTON_BACK_TO_SUMMARY))
+    assert msg.ASK_CONFIRM in text
+    after = next(iter(bot.store.state.drafts.values()))["proposal"]
+    assert {k: v for k, v in after.items() if k != "step"} == {
+        k: v for k, v in before.items() if k != "step"
+    }  # nothing changed, the account included
+    text, _ = await bot.press(button(buttons, msg.BUTTON_SAVE))
+    assert text.startswith("✅ Tersimpan")
+
+
+async def test_N02_cancel_stale_callbacks_and_restart_around_the_menu(bot: Bot) -> None:
+    summary = await _summary(bot)
+    account = next(iter(bot.store.state.drafts.values()))["proposal"]["account_id"]
+    _, menu = await bot.press(button(summary, msg.BUTTON_EDIT))
+    await bot.restart()  # the menu state lives in the database
+    text, _ = await bot.press(button(menu, msg.EDIT_FIELD_LABEL["amount"]))
+    assert msg.ASK_AMOUNT in text
+    text, _ = await bot.send("40rb")
+    assert "<b>Rp 40.000</b>" in text
+    text, _ = await bot.press(button(menu, msg.BUTTON_BACK_TO_SUMMARY))  # stale menu ↩️
+    assert msg.ASK_CONFIRM in text  # harmless: the summary again
+    text, _ = await bot.press(button(menu, msg.EDIT_FIELD_LABEL["date"]))  # stale field button
+    assert msg.ASK_DATE in text  # opens the date of the same draft, nothing else
+    text, _ = await bot.press(button(menu, msg.BUTTON_CANCEL))  # ❌ during an edit
+    assert text == msg.CANCELLED
+    text, _ = await bot.press(button(summary, msg.BUTTON_SAVE))
+    assert text == msg.DRAFT_EXPIRED
+    assert bot.store.state.transactions == {}
+    await _summary(bot)
+    assert next(
+        d["proposal"]["account_id"] for d in bot.store.state.drafts.values()
+        if d["status"].value == "pending"
+    ) == account  # fmt: skip

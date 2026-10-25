@@ -40,7 +40,12 @@ PENDING_ACTION_TTL: Final = timedelta(minutes=30)
 HISTORY_PAGE_SIZE: Final = 10  # FR-TXN-09
 HISTORY_MAX_PAGES: Final = 100  # no listing deeper than 1,000 rows; filter by date instead
 CATEGORY_PAGE_SIZE: Final = 20  # buttons per category page (Telegram: at most 100 per message)
-CATEGORY_MAX_PAGES: Final = 100  # 2,000 categories per listing; nobody pages further
+#: Categories per workspace and kind, archived ones included (Step 6C, F06). Enforced by the
+#: service under the workspace's category-name lock and by the database (revision 0006), so a
+#: listing never has more pages than CATEGORY_MAX_PAGES and every page is reachable.
+CATEGORY_QUOTA_PER_KIND: Final = 200
+#: Pages of the largest listing (both kinds together); every Next button stays below this.
+CATEGORY_MAX_PAGES: Final = 2 * CATEGORY_QUOTA_PER_KIND // CATEGORY_PAGE_SIZE  # 20 pages
 
 # --------------------------------------------------------------------------- defaults
 
@@ -450,6 +455,7 @@ class CaptureStep(StrEnum):
     DESCRIPTION = "description"
     DATE = "date"
     CONFIRM = "confirm"
+    REVIEW = "review"  # ✏️ Ubah: the confirmation with field buttons; nothing is being edited
 
 
 class EditField(StrEnum):
@@ -476,6 +482,9 @@ _FIELD_STEP: Final = {
     DraftField.DESCRIPTION: CaptureStep.DESCRIPTION,
     DraftField.DATE: CaptureStep.DATE,
 }
+
+#: Steps that show the complete confirmation (✅ is valid in both).
+_SUMMARY_STEPS: Final = (CaptureStep.CONFIRM, CaptureStep.REVIEW)
 
 #: Steps whose input is a typed text message (the others use buttons).
 TEXT_STEPS: Final = frozenset({CaptureStep.AMOUNT, CaptureStep.DESCRIPTION, CaptureStep.DATE})
@@ -544,8 +553,8 @@ class CaptureState:
 
     @property
     def revising(self) -> bool:
-        """A correction of a complete draft is in progress (offer "back to the summary")."""
-        return self.complete_fields and self.step is not CaptureStep.CONFIRM
+        """A field of a complete draft is being corrected (offer "back to the summary")."""
+        return self.complete_fields and self.step not in _SUMMARY_STEPS
 
     def with_type(self, txn_type: TxnType) -> "CaptureState":
         self._expect(CaptureStep.TYPE)
@@ -556,14 +565,20 @@ class CaptureState:
         # A category has a kind (FR-CAT-03): a new type needs a new category.
         return replace(self, txn_type=txn_type, category_id=None)._advance()
 
+    def review(self) -> "CaptureState":
+        """✏️ Ubah: show the confirmation with one button per field (the REVIEW step)."""
+        self._expect(*_SUMMARY_STEPS)
+        return replace(self, step=CaptureStep.REVIEW)
+
     def revise(self, draft_field: DraftField) -> "CaptureState":
         """Open one field of the confirmation for correction (FR-TXN-05)."""
-        self._expect(CaptureStep.CONFIRM)
+        self._expect(*_SUMMARY_STEPS)
         return replace(self, step=_FIELD_STEP[draft_field])
 
     def back(self) -> "CaptureState":
-        """Leave a correction unchanged and return to the confirmation."""
-        if not self.revising:
+        """↩️ Back to the confirmation, from the field menu or from a field left unchanged.
+        Already there (a repeated or stale ↩️): unchanged."""
+        if not self.complete_fields:
             raise StepError(self.step.value)
         return replace(self, step=CaptureStep.CONFIRM)
 
@@ -592,7 +607,7 @@ class CaptureState:
     def complete(self) -> tuple[TxnType, Rupiah, UUID]:
         """(type, amount, category) of a draft ready to confirm, or raise StepError."""
         if (
-            self.step is not CaptureStep.CONFIRM
+            self.step not in _SUMMARY_STEPS
             or self.txn_type is None
             or self.amount is None
             or self.category_id is None

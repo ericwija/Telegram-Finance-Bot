@@ -223,9 +223,11 @@ class PgFinanceSession:
             {"key": f"finbot.category-names:{self.ctx.workspace_id}"},
         )
 
-    async def count_categories(self) -> int:
+    async def count_categories(self, kind: TxnType | None = None) -> int:
         row = await self._one(
-            "SELECT count(*) AS n FROM public.categories WHERE workspace_id = :ws"
+            "SELECT count(*) AS n FROM public.categories WHERE workspace_id = :ws "
+            "AND (CAST(:kind AS text) IS NULL OR kind = :kind)",
+            {"kind": kind.value if kind else None},
         )
         return int(row.n)
 
@@ -544,6 +546,24 @@ class PgFinanceSession:
             "WHERE workspace_id = :ws AND user_id = :user AND id = :id",
             {"id": action_id, "status": status},
         )
+
+    async def expire_draft_if_pending(self, draft_id: UUID) -> bool:
+        rows = await self._rows(
+            "UPDATE public.drafts SET status = 'expired', updated_at = now() "
+            "WHERE workspace_id = :ws AND user_id = :user AND id = :id AND status = 'pending' "
+            "RETURNING id",
+            {"id": draft_id},
+        )
+        return bool(rows)
+
+    async def expire_action_if_pending(self, action_id: UUID) -> bool:
+        rows = await self._rows(
+            "UPDATE public.pending_actions SET status = 'expired' "
+            "WHERE workspace_id = :ws AND user_id = :user AND id = :id AND status = 'pending' "
+            "RETURNING id",
+            {"id": action_id},
+        )
+        return bool(rows)
 
     # -------------------------------------------------------------------- reports
 

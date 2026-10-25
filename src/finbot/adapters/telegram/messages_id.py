@@ -179,6 +179,10 @@ INVALID: Final = {
     "month_in_future": "Bulan itu belum berjalan.",
     "page": "Halaman tidak tersedia. Persempit dengan filter tanggal.",
     "no_changes": "Tidak ada perubahan.",
+    "category_limit": (
+        "Batas 200 kategori untuk jenis ini sudah tercapai (termasuk yang nonaktif). "
+        "Gunakan atau aktifkan kembali kategori yang ada."
+    ),
     "account_unavailable": (
         "Akun transaksi ini tidak tersedia lagi. Batalkan dengan /batal lalu catat ulang."
     ),

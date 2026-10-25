@@ -18,6 +18,7 @@ replaced by a short explanation (``fits_telegram``).
 """
 
 import logging
+import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
@@ -238,24 +239,43 @@ class FinanceHandlers:
     def __init__(self, services: FinanceServices) -> None:
         self.s = services
 
-    async def _run(self, update: Update, operation: Callable[[Actor], Awaitable[Reply]]) -> None:
+    async def _run(
+        self,
+        update: Update,
+        operation: Callable[[Actor], Awaitable[Reply]],
+        component: str | None = None,
+    ) -> None:
+        """Resolve the sender, run one service call, reply. Every request ends with exactly one
+        content-free ``finance.request`` log line (outcome, operation, duration, request id);
+        the same request id is stored on every audit event the request writes (F12)."""
         user = update.effective_user
         if user is None:
             return
         request_id = uuid.uuid4()
+        component = component or _operation_name(operation)
+        started = time.monotonic()
+        outcome, error_type = "ok", None
         try:
             actor = replace(await self.s.principals.actor(user.id), request_id=request_id)
             text, keyboard = await operation(actor)
         except _EXPECTED as exc:
+            outcome, error_type = "refused", type(exc).__name__
+            text, keyboard = error_text(exc) or msg.GENERIC_ERROR, []
+        except Exception as exc:
+            outcome, error_type = "failed", type(exc).__name__
+            raise  # the application's error handler answers generically
+        finally:
             logger.info(
-                "finance request refused",
+                "finance request finished",
                 extra={
-                    "event": "finance.refused",
-                    "error_type": type(exc).__name__,
+                    "event": "finance.request",
+                    "outcome": outcome,
+                    "component": component,
+                    "error_type": error_type,
                     "request_id": request_id,
+                    "duration_ms": round((time.monotonic() - started) * 1000),
                 },
             )
-            text, keyboard = error_text(exc) or msg.GENERIC_ERROR, []
         await _send(update, text, keyboard)
 
     # ------------------------------------------------------------------- commands
@@ -292,7 +312,7 @@ class FinanceHandlers:
             )
             return render.render_draft(view)
 
-        await self._run(update, op)
+        await self._run(update, op, "start")
 
     async def cancel(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         async def op(actor: Actor) -> Reply:
@@ -384,7 +404,7 @@ class FinanceHandlers:
             await _answer(query, msg.STALE_BUTTON)
             return
         await _answer(query)
-        await self._run(update, lambda actor: self._dispatch(actor, data))
+        await self._run(update, lambda actor: self._dispatch(actor, data), f"button.{data.action}")
 
     async def _dispatch(self, actor: Actor, data: cb.Callback) -> Reply:
         handler = self._BUTTONS.get(data.action)
@@ -411,7 +431,7 @@ class FinanceHandlers:
         return render.render_draft(await self.s.capture.skip_description(actor, _ref(data)))
 
     async def _b_review(self, actor: Actor, data: cb.Callback) -> Reply:
-        return render.render_draft_review(await self.s.capture.review(actor, _ref(data)))
+        return render.render_draft(await self.s.capture.review(actor, _ref(data)))
 
     async def _b_revise(self, actor: Actor, data: cb.Callback) -> Reply:
         return render.render_draft(
@@ -516,6 +536,12 @@ class FinanceHandlers:
         "kr": _b_category_rename,
         "ka": _b_category_active,
     }
+
+
+def _operation_name(operation: Callable[..., object]) -> str:
+    """``FinanceHandlers.history.<locals>.op`` → ``history`` (a code name, never user data)."""
+    qualname = getattr(operation, "__qualname__", "finance")
+    return qualname.split(".<locals>", 1)[0].rsplit(".", 1)[-1]
 
 
 def _ref(data: cb.Callback) -> str:

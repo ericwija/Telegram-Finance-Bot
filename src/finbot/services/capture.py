@@ -21,8 +21,12 @@ The conversation state lives in PostgreSQL (NFR-AVL-05), never in process memory
   so a double tap or a Telegram retry stores exactly one transaction. A replay reports the
   transaction only to a caller who still holds the permission, under the same membership,
   while the transaction is not voided; otherwise it is answered like an expired button;
-* permission is checked when the draft is used, with the membership of that moment (G-2,
-  R-9): a member downgraded or removed meanwhile is refused, and their draft expires;
+* permission is checked when the conversation is used **or cancelled**, with the membership
+  of that moment (G-2, R-9): a member who no longer holds the conversation's permission is
+  refused (audited) and *that* conversation is invalidated (``expired``), never another one.
+  The invalidation runs after the refused transaction rolled back, as a conditional update
+  of the rejected conversation's own id (``pending`` → ``expired``), so a newer conversation
+  started meanwhile is never touched (Step 6C, N01);
 * drafts expire after 24 hours, category-name prompts after 30 minutes. An expired
   conversation is **persisted** as expired before the request is refused (the refusal is
   raised only after the transaction committed).
@@ -135,7 +139,29 @@ def _amount(text: str) -> ParsedAmount:
 
 
 def _same_membership(data: dict[str, Any], s: FinanceSession) -> bool:
+    """A conversation without a recorded version (created before Step 6B) never matches."""
     return data.get(MEMBERSHIP_KEY) == s.ctx.membership_version
+
+
+class ConversationForbiddenError(ForbiddenError):
+    """The caller may no longer use (or cancel) this exact conversation. Audited like any
+    refusal, with the conversation's entity type; the service then invalidates only it."""
+
+    def __init__(
+        self,
+        denied: ForbiddenError,
+        *,
+        draft_id: UUID | None = None,
+        action_id: UUID | None = None,
+    ) -> None:
+        super().__init__(
+            denied.permission,
+            denied.reason,
+            denied.role,
+            entity="category" if action_id is not None else "draft",
+        )
+        self.draft_id = draft_id
+        self.action_id = action_id
 
 
 class CaptureService(FinanceServiceBase):
@@ -195,20 +221,28 @@ class CaptureService(FinanceServiceBase):
         if draft is None or (ref is not None and draft_ref(draft.id) != ref):
             return None, False
         if draft.expires_at > self._clock():
-            authorize(s.ctx, _permission_for(draft_state(draft.proposal)))
+            try:
+                authorize(s.ctx, _permission_for(draft_state(draft.proposal)))
+            except ForbiddenError as exc:
+                raise ConversationForbiddenError(exc, draft_id=draft.id) from None
             if _same_membership(draft.proposal, s):
                 return draft, False
         await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
         logger.info("draft expired", extra={"event": "draft.expired"})
         return None, True
 
-    async def _pending_action(self, s: FinanceSession) -> tuple[PendingAction | None, bool]:
+    async def _pending_action(
+        self, s: FinanceSession, ref: str | None = None
+    ) -> tuple[PendingAction | None, bool]:
         """As :meth:`_pending`, for the caller's pending category-name prompt."""
         action = await s.pending_action(for_update=True)
-        if action is None:
+        if action is None or (ref is not None and draft_ref(action.id) != ref):
             return None, False
         if action.expires_at > self._clock():
-            authorize(s.ctx, Permission.CATEGORY_MANAGE)
+            try:
+                authorize(s.ctx, Permission.CATEGORY_MANAGE)
+            except ForbiddenError as exc:
+                raise ConversationForbiddenError(exc, action_id=action.id) from None
             if _same_membership(action.payload, s):
                 return action, False
         await s.set_pending_action_status(action.id, "expired")
@@ -245,8 +279,8 @@ class CaptureService(FinanceServiceBase):
                     state = await update(s, draft_state(draft.proposal), self._today(s.ctx))
                     await s.update_draft(draft.id, self._proposal(s, state))
                     return await self._view(s, draft, state, page)
-        except ForbiddenError:
-            await self._expire_after_denial(actor)
+        except ForbiddenError as exc:
+            await self._invalidate(actor, exc)
             raise
         raise DraftExpiredError("draft")  # stale, expired (now persisted) or gone
 
@@ -316,12 +350,13 @@ class CaptureService(FinanceServiceBase):
         return await self._step(actor, ref, update)
 
     async def review(self, actor: Actor, ref: str) -> DraftView:
-        """The confirmation of a complete create draft, to choose a field to correct."""
+        """✏️ Ubah: the confirmation of a complete create draft with one button per field
+        (the persisted REVIEW step, so it survives a restart)."""
 
         async def update(_: FinanceSession, state: DraftState, today: date) -> DraftState:
-            if not isinstance(state, CaptureState) or state.step is not CaptureStep.CONFIRM:
+            if not isinstance(state, CaptureState):
                 raise StepError(state.step.value)
-            return state
+            return state.review()
 
         return await self._step(actor, ref, update)
 
@@ -375,8 +410,8 @@ class CaptureService(FinanceServiceBase):
         """A plain message: the answer to the current text step, or None if none is waiting."""
         try:
             return await self._input_text(actor, text)
-        except ForbiddenError:
-            await self._expire_after_denial(actor)
+        except ForbiddenError as exc:
+            await self._invalidate(actor, exc)
             raise
 
     async def _input_text(self, actor: Actor, text: str) -> TextOutcome:
@@ -437,8 +472,8 @@ class CaptureService(FinanceServiceBase):
                             extra={"event": "draft.confirmed", "request_id": actor.request_id},
                         )
                         return ConfirmResult(record, draft.purpose, False, WorkspaceInfo.of(s.ctx))
-        except ForbiddenError:
-            await self._expire_after_denial(actor)
+        except ForbiddenError as exc:
+            await self._invalidate(actor, exc)
             raise
         if failure is None:  # pragma: no cover - every branch above returns or sets it
             raise AssertionError("unreachable")
@@ -490,9 +525,15 @@ class CaptureService(FinanceServiceBase):
             return DraftExpiredError("draft")
         return ConfirmResult(record, draft.purpose, True, WorkspaceInfo.of(s.ctx))
 
-    async def _expire_after_denial(self, actor: Actor) -> None:
-        """R-9 / docs/08 §6: a member who lost the permission loses their pending
-        conversation (the draft and any category prompt)."""
+    async def _invalidate(self, actor: Actor, denied: ForbiddenError) -> None:
+        """R-9 / docs/08 §6: the conversation the caller was refused is invalidated.
+
+        Only the refused conversation, identified by its id, and only while it is still
+        pending: if another request replaced it in the meantime, nothing changes (N01). A
+        refusal that is not about a conversation (e.g. starting one) invalidates nothing.
+        """
+        if not isinstance(denied, ConversationForbiddenError):
+            return
         try:
             async with self._store.session(
                 actor.user_id,
@@ -500,12 +541,10 @@ class CaptureService(FinanceServiceBase):
                 mode=SessionMode.WRITE,
                 request_id=actor.request_id,
             ) as s:
-                draft = await s.pending_draft(for_update=True)
-                if draft is not None:
-                    await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
-                action = await s.pending_action(for_update=True)
-                if action is not None:
-                    await s.set_pending_action_status(action.id, "expired")
+                if denied.draft_id is not None:
+                    await s.expire_draft_if_pending(denied.draft_id)
+                if denied.action_id is not None:
+                    await s.expire_action_if_pending(denied.action_id)
         except NotFoundError:
             return  # no longer a member at all: nothing visible to expire
 
@@ -513,22 +552,34 @@ class CaptureService(FinanceServiceBase):
         """``/batal`` (``ref`` None): cancel the conversation in progress, whatever it is.
 
         A ❌ button (``ref`` given) cancels only the conversation it belongs to: the pending
-        draft or the pending category prompt whose reference is exactly ``ref``. A stale ❌ of
-        an older conversation changes nothing (F08).
+        draft or category prompt whose reference is exactly ``ref``; a stale ❌ changes nothing
+        (F08). Cancelling is validated exactly like continuing (F01, Step 6C): the conversation
+        must not be expired, the caller must still hold its permission in a workspace whose
+        status allows it, and its membership version must be current. A refused cancel raises
+        ForbiddenError (audited) and the conversation is *invalidated* (``expired``), never
+        ``cancelled``; an expired or out-of-epoch one is marked ``expired`` and False is
+        returned.
         """
         cancelled = False
-        async with self._session(actor, None, write=True, entity="draft") as s:
-            await s.lock_conversation()
-            draft = await s.pending_draft(for_update=True)
-            if draft is not None and (ref is None or draft_ref(draft.id) == ref):
-                await s.set_draft_status(draft.id, DraftStatus.CANCELLED)
-                cancelled = True
-            action = await s.pending_action(for_update=True)
-            if action is not None and (ref is None or draft_ref(action.id) == ref):
-                await s.set_pending_action_status(action.id, "cancelled")
-                cancelled = True
+        try:
+            async with self._session(actor, None, write=True, entity="draft") as s:
+                await s.lock_conversation()
+                draft, _ = await self._pending(s, ref)
+                if draft is not None:
+                    await s.set_draft_status(draft.id, DraftStatus.CANCELLED)
+                    cancelled = True
+                action, _ = await self._pending_action(s, ref)
+                if action is not None:
+                    await s.set_pending_action_status(action.id, "cancelled")
+                    cancelled = True
+        except ForbiddenError as exc:
+            await self._invalidate(actor, exc)
+            raise
         if cancelled:
-            logger.info("draft cancelled", extra={"event": "draft.cancelled"})
+            logger.info(
+                "draft cancelled",
+                extra={"event": "draft.cancelled", "request_id": actor.request_id},
+            )
         return cancelled
 
     # ----------------------------------------------------------------------- edit

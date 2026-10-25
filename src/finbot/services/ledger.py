@@ -22,6 +22,7 @@ from finbot.authz.permissions import Permission
 from finbot.authz.policy import allowed, authorize
 from finbot.domain.finance import (
     CATEGORY_PAGE_SIZE,
+    CATEGORY_QUOTA_PER_KIND,
     HISTORY_PAGE_SIZE,
     BalanceReport,
     Category,
@@ -103,6 +104,8 @@ async def create_category_in(s: FinanceSession, kind: TxnType, name: str) -> Cat
     await s.lock_category_names()
     if await s.find_active_category(kind, clean) is not None:
         raise DuplicateNameError(clean)
+    if await s.count_categories(kind) >= CATEGORY_QUOTA_PER_KIND:  # F06; also revision 0006
+        raise InvalidInputError("category_limit")
     category = await s.insert_category(kind, clean)
     if category is None:  # a concurrent create won
         raise DuplicateNameError(clean)

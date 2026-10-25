@@ -23,8 +23,35 @@ def sql_0005(monkeypatch: pytest.MonkeyPatch) -> str:
 
 def test_the_release_supports_exactly_the_head_revision() -> None:
     revisions = sorted(p.name[:4] for p in VERSIONS.glob("[0-9][0-9][0-9][0-9]_*.py"))
-    assert revisions[-1] == "0005"
+    assert revisions[-1] == "0006"
     assert frozenset({revisions[-1]}) == SUPPORTED_SCHEMA_REVISIONS
+
+
+@pytest.fixture
+def sql_0006(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setenv("FINBOT_ENV", "staging")
+    out, err = io.StringIO(), io.StringIO()
+    assert migrate.main(["sql", "upgrade", "0005:0006"], out=out, err=err) == 0, err.getvalue()
+    return out.getvalue()
+
+
+def test_0006_quota_matches_the_domain_and_is_additive(sql_0006: str) -> None:
+    from finbot.domain.finance import (  # noqa: PLC0415
+        CATEGORY_MAX_PAGES,
+        CATEGORY_PAGE_SIZE,
+        CATEGORY_QUOTA_PER_KIND,
+    )
+
+    assert f">= {CATEGORY_QUOTA_PER_KIND} THEN" in sql_0006
+    assert CATEGORY_MAX_PAGES * CATEGORY_PAGE_SIZE == 2 * CATEGORY_QUOTA_PER_KIND
+    assert "SECURITY DEFINER SET search_path = pg_catalog, public" in sql_0006
+    assert "REVOKE ALL ON FUNCTION public.ledger_category_quota() FROM PUBLIC;" in sql_0006
+    assert "GRANT" not in sql_0006
+    assert "BEFORE INSERT ON public.categories" in sql_0006
+    body = sql_0006.split("BEGIN;", 1)[-1]
+    assert "%" not in body
+    for forbidden in ("DROP TABLE", "DELETE FROM", "ALTER TABLE", "UPDATE public.categories"):
+        assert forbidden not in sql_0006
 
 
 def test_0005_grants_no_table_privilege_and_one_narrow_function(sql_0005: str) -> None:

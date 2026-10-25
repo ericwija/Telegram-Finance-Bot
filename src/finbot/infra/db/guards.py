@@ -14,7 +14,7 @@ G-ENV-7 (Step 6B): the bot refuses to serve a database whose schema revision
 still at ``0003``, before the ledger tables) or ahead, or whose revision cannot be read, is
 refused before polling starts and before the heartbeat reports healthy. The bot never migrates:
 the operator runs ``finbot-migrate`` (docs/10 §13). The revision is read through
-``public.app_schema_revision()`` (revision ``0005``; ``finbot_app`` has no privilege on
+``public.app_schema_revision()`` (since revision ``0005``; ``finbot_app`` has no privilege on
 ``alembic_version`` itself); on an older schema that function does not exist, which is
 reported the same way.
 """
@@ -39,7 +39,7 @@ class SchemaMismatchError(EnvironmentMismatchError):
 
 #: Schema revisions this release runs against. A release that adds a revision adds it here; an
 #: expand-only revision may be listed next to its predecessor while both are compatible.
-SUPPORTED_SCHEMA_REVISIONS: Final = frozenset({"0005"})
+SUPPORTED_SCHEMA_REVISIONS: Final = frozenset({"0006"})
 #: undefined_function (before 0005), insufficient_privilege, undefined_table.
 _UNREADABLE: Final = frozenset({"42883", "42501", "42P01"})
 

@@ -19,6 +19,7 @@ from zoneinfo import ZoneInfo
 from finbot.adapters.telegram import finance_callbacks as cb
 from finbot.adapters.telegram import messages_id as msg
 from finbot.domain.finance import (
+    CATEGORY_MAX_PAGES,
     HISTORY_PAGE_SIZE,
     CaptureState,
     CaptureStep,
@@ -107,7 +108,14 @@ def _rows(buttons: list[Button], per_row: int = 2) -> Keyboard:
 def render_draft(view: DraftView) -> Reply:
     if isinstance(view.state, EditState):
         return _render_edit(view, view.state)
+    if view.state.step is CaptureStep.REVIEW:
+        return render_draft_review(view)
     return _render_capture(view, view.state)
+
+
+def _has_next(page: int, has_next: bool) -> bool:
+    """A Next button only towards a page the callback codec accepts (F06)."""
+    return has_next and page + 1 < CATEGORY_MAX_PAGES
 
 
 def _capture_lines(view: DraftView, state: CaptureState) -> list[str]:
@@ -133,7 +141,7 @@ def _category_buttons(view: DraftView) -> Keyboard:
     nav: list[Button] = []
     if view.category_page > 0:
         nav.append((msg.BUTTON_PREV, cb.draft_category_page(view.ref, view.category_page - 1)))
-    if view.categories_has_next:
+    if _has_next(view.category_page, view.categories_has_next):
         nav.append((msg.BUTTON_NEXT, cb.draft_category_page(view.ref, view.category_page + 1)))
     return [*keyboard, nav] if nav else keyboard
 
@@ -412,7 +420,7 @@ def render_categories(listing: CategoryListing) -> Reply:
             (msg.BUTTON_PREV, cb.category_list(listing.kind, listing.page - 1,
                                                archived=listing.archived))
         )  # fmt: skip
-    if listing.has_next:
+    if _has_next(listing.page, listing.has_next):
         nav.append(
             (msg.BUTTON_NEXT, cb.category_list(listing.kind, listing.page + 1,
                                                archived=listing.archived))

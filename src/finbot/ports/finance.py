@@ -82,7 +82,10 @@ class FinanceSession(Protocol):
         (whose detail would carry the name into the server log; docs/09 §10)."""
         ...
 
-    async def count_categories(self) -> int: ...
+    async def count_categories(self, kind: TxnType | None = None) -> int:
+        """Categories of the workspace (of ``kind``), archived ones included."""
+        ...
+
     async def list_categories(
         self,
         kind: TxnType | None = None,
@@ -186,6 +189,14 @@ class FinanceSession(Protocol):
         self, kind: PendingKind, payload: Mapping[str, Any], expires_at: datetime
     ) -> UUID: ...
     async def set_pending_action_status(self, action_id: UUID, status: str) -> None: ...
+
+    # ------------------------------------------------- targeted invalidation (N01)
+    async def expire_draft_if_pending(self, draft_id: UUID) -> bool:
+        """Expire exactly this draft, only if it is still pending (a conditional update: a
+        newer conversation that replaced it is never touched)."""
+        ...
+
+    async def expire_action_if_pending(self, action_id: UUID) -> bool: ...
 
     # ----------------------------------------------------------------- reports
     async def cash_flow(

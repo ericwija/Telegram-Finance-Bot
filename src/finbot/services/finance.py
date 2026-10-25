@@ -108,7 +108,8 @@ class FinanceServiceBase:
         entity: str | None = None,
     ) -> AsyncIterator[FinanceSession]:
         """The request's unit of work, authorized for ``permission`` (default: the baseline
-        ``workspace.view``). ``entity`` is the audited entity type of a refusal."""
+        ``workspace.view``). ``entity`` is the audited entity type of a refusal, unless the
+        refusal names a more precise one (a category prompt inside a draft operation)."""
         mode = SessionMode.WRITE if write else SessionMode.READ
         ctx: WorkspaceContext | None = None
         seeded = False
@@ -140,7 +141,7 @@ class FinanceServiceBase:
                     workspace_id=ctx.workspace_id,
                     permission=exc.permission.value,
                     role=exc.role,
-                    entity_type=entity,
+                    entity_type=exc.entity or entity,
                     channel=actor.channel,
                     request_id=actor.request_id,
                 )

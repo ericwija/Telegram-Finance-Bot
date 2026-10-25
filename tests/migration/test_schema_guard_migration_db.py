@@ -1,4 +1,4 @@
-"""Revision 0005 and the start-up schema guard G-ENV-7 (Step 6B: F05, R03; docs/10 §13).
+"""Revisions 0005/0006 and the start-up schema guard G-ENV-7 (Steps 6B/6C; docs/10 §13, §14).
 
 * the bot accepts only a supported schema revision and refuses a database that is behind
   (``0003``, ``0004``), never migrated, or at an unexpected revision, before the poller lock,
@@ -35,7 +35,7 @@ from tests.unit.test_bot_lifecycle import Run
 
 pytestmark = pytest.mark.db
 
-HEAD = "0005"
+HEAD = "0006"
 
 
 def _guard(cluster: pg.ClusterInfo, database: str, *, full: bool = False) -> None:
@@ -59,12 +59,23 @@ def test_AT_ENV_07_compatible_schema_passes_every_guard(
     _guard(pg_cluster, test_database, full=True)  # G-ENV-2, G-ENV-3 and G-ENV-7
 
 
-@pytest.mark.parametrize("revision", ["0003", "0004"])
+@pytest.mark.parametrize(
+    ("revision", "reason"),
+    [
+        ("0003", "unreadable"),
+        ("0004", "unreadable"),
+        ("0005", "is '0005', this release supports 0006"),
+    ],
+)
 def test_AT_ENV_07_a_database_behind_the_release_is_refused(
-    alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str, revision: str
+    alembic_config: Config,
+    pg_cluster: pg.ClusterInfo,
+    test_database: str,
+    revision: str,
+    reason: str,
 ) -> None:
     command.upgrade(alembic_config, revision)
-    with pytest.raises(SchemaMismatchError, match="unreadable"):
+    with pytest.raises(SchemaMismatchError, match=reason):
         _guard(pg_cluster, test_database, full=True)
 
 
@@ -79,7 +90,7 @@ def test_AT_ENV_07_a_never_migrated_database_is_refused(
     "sql",
     [
         "UPDATE alembic_version SET version_num = '0099'",
-        "INSERT INTO alembic_version VALUES ('0006')",  # two rows: no single revision
+        "INSERT INTO alembic_version VALUES ('0007')",  # two rows: no single revision
         "DELETE FROM alembic_version",
     ],
 )
@@ -88,7 +99,7 @@ def test_AT_ENV_07_an_unexpected_revision_is_refused(
 ) -> None:
     command.upgrade(alembic_config, "head")
     _query(pg_cluster, test_database, sql)
-    with pytest.raises(SchemaMismatchError, match="this release supports 0005"):
+    with pytest.raises(SchemaMismatchError, match="this release supports 0006"):
         _guard(pg_cluster, test_database)
 
 
