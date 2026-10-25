@@ -204,7 +204,36 @@ The platform-admin invite commands (`/undangan_baru [catatan]`, `/undangan_dafta
 
 Replies are HTML with every interpolated value escaped, and link previews off. Telegram API errors on a reply are logged by type only; other handler errors are logged by type only and answered with a generic message. `httpx`, `httpcore` and `telegram` loggers are set to WARNING because httpx logs request URLs, which contain the bot token.
 
-`finbot bot --dry-run` builds the whole application offline (a transport that refuses every Bot API call, an engine that never connects) and prints the commands and limits. `finbot bot` long-polls after checking the database environment marker (G-ENV-3) and the bot username (G-ENV-4). The single-poller advisory lock (G-ENV-6) is not implemented yet. The in-memory limits assume one bot process per environment.
+`finbot bot --dry-run` builds the whole application offline (a transport that refuses every Bot API call, an engine that never connects) and prints the commands and limits.
+
+**Running the bot: exactly one poller per environment (Step 4D; G-ENV-6, NFR-AVL-06, AC-P1-04).** `finbot bot [--health-file PATH]` (`adapters/telegram/runtime.py`) runs these steps in order, and polling starts only after all of them pass:
+
+1. **G-ENV-3:** `platform_meta.environment` must equal `FINBOT_ENV`.
+2. **G-ENV-6:** the bot takes `pg_try_advisory_lock(<class>, hashtext('telegram-poller:<env>'))` on a **dedicated autocommit connection** (`infra/db/poller_lock.py`).
+   - The lock is session-level, so it lasts as long as that connection.
+   - A second process gets `false` and exits with code 3 and "poller lock held by another process". It never contacts Telegram.
+3. **G-ENV-4:** `getMe` must return `FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME`.
+4. **Polling starts.**
+   - Every 10 s the lock connection checks `pg_locks` to confirm it still holds the lock, and the heartbeat file is rewritten.
+   - If the check fails (connection lost, backend terminated, query timed out after 5 s), polling stops at once. The application shuts down and the process exits with code 4 ("poller lock lost"), so the restart policy starts a fresh process, which must win the lock again.
+   - The worst-case overlap after a loss is one check interval plus the timeout (≈15 s). Telegram itself refuses a second concurrent `getUpdates` on the same token (409 Conflict), so updates are not delivered twice in that window.
+
+**Shutdown.** SIGTERM (`docker stop`) or SIGINT stops polling and lets in-flight handlers finish. The application then shuts down (closing the HTTP client), the bot unlocks and closes the lock connection, and disposes the engine. Exit code 0. A signal that arrives during start-up stops the bot before it polls.
+
+**Crash or kill.** PostgreSQL drops the session lock with the connection, so no operator cleanup is ever needed. If the network to the database drops but the server keeps the session open, the old session's lock stays until the server notices that the client is gone (TCP keepalive). Until then, a restarted bot is refused and the restart policy retries it.
+
+**Health and readiness.**
+- With `--health-file PATH` the bot writes a small JSON file atomically (mode 0640). It contains only `state` (`starting|ready|stopping|stopped|failed`), `env`, `pid`, `lock_held`, `polling` and `updated_at`.
+- `finbot healthcheck --health-file PATH [--max-age 60] [--json]` exits 0 only for a fresh `ready` heartbeat that holds the lock and is polling, and 1 otherwise. That covers a missing or corrupt file, a stale file (hung loop), a lost lock and a stopped bot.
+- Neither the file nor the probe contains a token, credential, invite link, user ID or message text.
+- Lifecycle log events: `poller_lock.acquired`, `bot.polling_started`, `poller_lock.check_failed` (error type only), `poller_lock.lost`, `bot.shutdown_requested` (signal name), `poller_lock.released`, `bot.stopped` (final state).
+- Start-up refusals name the guard; an unexpected failure is reported by error type only.
+
+**Operator rules.**
+- Run one `bot` service per environment (compose `replicas: 1`, never `--scale bot=N`).
+- Never run a local `finbot bot` against a shared database.
+- A "poller lock held" refusal means another instance is live. Find it, and never work around the lock.
+- The in-memory duplicate and rate-limit state (`ratelimit.py`) relies on this single process.
 
 ## 6. Request flows
 
@@ -297,7 +326,7 @@ networks: db (internal: true + gateway mode isolated; no egress, no host path; f
 | **Image** | Official `postgres` image, **PostgreSQL 18**, Debian variant, pinned as `postgres:18.<minor>-<debian-codename>@sha256:<digest>`. **Chosen in P1 Step 3A (2026-10-24): `postgres:18.6-trixie@sha256:edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6`** (multi-arch index digest; 18.6 released 2026-08-13, 18.5 was never released), recorded in `deploy/staging/compose.yml`. **Never** `latest`, `18` or an unpinned tag. Minor updates go through a reviewed PR (Renovate or Dependabot), are applied after a fresh backup, and are noted in the changelog. A major upgrade (19+) needs a separate written plan (dump/restore or `pg_upgrade`); it never happens by changing the tag. |
 | **Persistent storage** | A named volume per environment (`finbot-<env>_pgdata`). **Verified in Step 3A** from the pinned image's config and Dockerfile: `VOLUME /var/lib/postgresql` and `PGDATA=/var/lib/postgresql/18/docker` (the pre-18 `/var/lib/postgresql/data` mount is detected by the entrypoint and refused). The volume is mounted at `/var/lib/postgresql`, and `PGDATA` is set explicitly in compose so a future image default change cannot silently create a new, empty cluster. Bind mounts to arbitrary host paths are not used. |
 | **No public port** | The `postgres` service has **no `ports:` key** in the staging or production compose files. It is attached only to the `db` network: `internal: true` **and** `com.docker.network.bridge.gateway_mode_ipv4: isolated`, with a fixed subnet (staging `172.31.250.0/27`). `internal` alone still gives the bridge a host address, so host processes could reach container IPs and containers could reach host services on `0.0.0.0` (Docker documentation); `isolated` assigns no bridge address. `pg_hba.conf` names this subnet explicitly (no `samenet`) and rejects its gateway address. Application containers that need the internet (bot: Telegram, Gemini; backup: object storage) join `db` **and** a separate, non-internal `egress` network; postgres never joins `egress`. A check (AT-DEP-01, `tests/deploy/`) fails if `ports:` appears under `postgres` in `deploy/staging/compose.yml` (later also `deploy/prod/compose.yml`). Developer machines may use `compose.dev.yml`, which binds `127.0.0.1:55432` only, and that file is never used on a VPS. |
-| **Healthcheck** | `test -f /var/lib/postgresql/18/finbot-init.done && pg_isready -h 127.0.0.1 -p 5432 -d finbot_<env> -U postgres` (the marker is written by `00-roles.sh` only after a verified initialisation, so a half-initialised cluster is never healthy); interval 10 s, timeout 5 s, retries 6, start_period 30 s. `migrate` runs `depends_on: postgres: condition: service_healthy`; `bot` runs `depends_on: migrate: condition: service_completed_successfully`. The bot also has its own healthcheck: a heartbeat file updated by a job tick and checked by `finbot healthcheck`. |
+| **Healthcheck** | `test -f /var/lib/postgresql/18/finbot-init.done && pg_isready -h 127.0.0.1 -p 5432 -d finbot_<env> -U postgres` (the marker is written by `00-roles.sh` only after a verified initialisation, so a half-initialised cluster is never healthy); interval 10 s, timeout 5 s, retries 6, start_period 30 s. `migrate` runs `depends_on: postgres: condition: service_healthy`; `bot` runs `depends_on: migrate: condition: service_completed_successfully`. The bot also has its own healthcheck: a heartbeat file rewritten on every poller-lock check (10 s) and checked by `finbot healthcheck --health-file PATH` (§5.8). |
 | **Authentication** | `POSTGRES_PASSWORD_FILE=/run/secrets/db_superuser_password`; `POSTGRES_INITDB_ARGS=--auth-host=scram-sha-256 --auth-local=scram-sha-256`; `password_encryption=scram-sha-256`. A version-controlled `pg_hba.conf` (`-c hba_file=…`, read-only mount) replaces the image's catch-all: the superuser only inside the container (socket or 127.0.0.1, password required), application roles only to `finbot_<env>` from the db network's explicit subnet or in-container loopback, the subnet's gateway address and everything else `reject`. The superuser is used only by the init script and break-glass. |
 | **Initialization** | `/docker-entrypoint-initdb.d/00-roles.sh` (`deploy/postgres/initdb/00-roles.sh`, executable, runs only on an empty volume, with statement logging disabled for its session; idempotent, so an operator can re-run it via `docker exec` to repair a failed first initialisation) creates (if missing) and then enforces the login roles `finbot_owner`, `finbot_app` and `finbot_backup`, with passwords read from Docker secrets, plus `finbot_readonly NOLOGIN`, and the database `finbot_<env>` owned by `finbot_owner`. **All grants, RLS and schema** are created by Alembic as `finbot_owner`, not by the init script. |
 | **Environment marker** | The first Alembic revision creates `platform_meta(key text primary key, value text)` and inserts `('environment', '<env>')` from migration config. The bot refuses to start if the marker differs from `FINBOT_ENV` (guard G-ENV-3, §8.3). |
@@ -328,7 +357,7 @@ networks: db (internal: true + gateway mode isolated; no egress, no host path; f
 | G-ENV-3 | `platform_meta.environment` = `FINBOT_ENV`. This stops a production dump restored into staging from being served by the staging bot |
 | G-ENV-4 | Telegram `getMe().username` = `TELEGRAM_EXPECTED_BOT_USERNAME`. This stops the production token from being used with the staging config, or the reverse |
 | G-ENV-5 | In `production` and `staging`, every secret comes from a `*_FILE` path. Inline secret environment variables are rejected |
-| G-ENV-6 | Single-poller advisory lock acquired (NFR-AVL-06) |
+| G-ENV-6 | Single-poller advisory lock acquired on a dedicated connection and re-checked while polling (NFR-AVL-06; §5.8). Order at start-up: G-ENV-3, G-ENV-6, G-ENV-4, then polling |
 
 **Host and operators (D24, approved 2026-10-24):** staging runs on the existing Contabo VPS next to an unrelated `services` stack (`services-postgres` and `services-redis`, both published on 127.0.0.1 only; network `services_default`; volumes `services_*`). No V2 name, port, network or subnet overlaps with it, and V2 never attaches to `services_default`. Roles on the host: **`claude`** is the development user (repository, tests, static checks) and has **no Docker access**, by owner decision; **`deploy`** is the only Docker operator (pull, up, down, logs, exec); **root (sudo)** creates the `finbot-staging` group (gid 2999) and the secret files. Membership of the `docker` group is root-equivalent, so it stays limited to `deploy`.
 

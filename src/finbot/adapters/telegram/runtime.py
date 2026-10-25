@@ -5,13 +5,32 @@ handlers) with a transport that refuses every request, prints what would run, an
 contacts neither Telegram nor PostgreSQL, needs no bot token, and is the local way to check the
 wiring.
 
-A real run (Step 5, staging only, operated by ``deploy``) long-polls Telegram. Before any
-update is processed it checks the database environment marker (G-ENV-3) and that the token
-belongs to ``FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME`` (G-ENV-4). The single-poller advisory
-lock (G-ENV-6, AC-P1-04) is not implemented yet; run one bot process per environment.
+A real run (Step 5, staging only, operated by ``deploy``) long-polls Telegram. Its lifecycle
+(:func:`serve`) is strictly ordered, and polling starts only after every guard passed:
+
+1. G-ENV-3: the database environment marker equals ``FINBOT_ENV``.
+2. G-ENV-6: the single-poller advisory lock is taken on a dedicated connection
+   (:mod:`finbot.infra.db.poller_lock`). If another process holds it, the bot exits with
+   "poller lock held" (AC-P1-04) without ever contacting Telegram.
+3. G-ENV-4: ``getMe`` (application initialisation) returns
+   ``FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME``.
+4. Polling starts. Every ``heartbeat_interval`` the lock is re-checked on its connection and the
+   heartbeat file is rewritten. If the check fails (connection lost, backend terminated) polling
+   stops at once and the process exits with :data:`PollerLockLostError`, so the container
+   restarts and must win the lock again.
+
+SIGTERM and SIGINT request a graceful stop: polling stops, in-flight handlers finish, the
+application shuts down, the lock is released and the engine is disposed. Every refusal is a
+:class:`BotStartupError` whose message names the guard and never contains a secret.
 """
 
-from typing import Any, TextIO, override
+import asyncio
+import logging
+import signal
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Protocol, TextIO, override
 
 from telegram._utils.defaultvalue import DEFAULT_NONE
 from telegram._utils.types import ODVInput
@@ -27,8 +46,11 @@ from finbot.adapters.telegram.bot import (
 )
 from finbot.adapters.telegram.ratelimit import BAD_STARTS_PER_MINUTE, UPDATES_PER_MINUTE
 from finbot.config import Settings
+from finbot.infra.heartbeat import BotState, Heartbeat
 from finbot.services.onboarding import OnboardingService
 from finbot.services.platform_invites import PlatformInviteService
+
+logger = logging.getLogger(__name__)
 
 #: Placeholder for --dry-run; never valid for the Bot API, and the transport refuses anyway.
 DRY_RUN_TOKEN = "0:dry-run-no-network"  # noqa: S105 - not a secret; refused offline
@@ -36,6 +58,21 @@ DRY_RUN_TOKEN = "0:dry-run-no-network"  # noqa: S105 - not a secret; refused off
 
 class BotStartupError(RuntimeError):
     """A start-up guard refused to run the bot."""
+
+
+class PollerLockLostError(RuntimeError):
+    """The poller lock was lost while polling; polling was stopped (G-ENV-6)."""
+
+
+class HeldLock(Protocol):
+    async def verify(self) -> bool: ...
+    async def release(self) -> None: ...
+
+
+@dataclass(frozen=True, slots=True)
+class Timings:
+    #: How often the lock is re-checked and the heartbeat rewritten.
+    heartbeat_interval: float = 10.0
 
 
 class OfflineRequest(BaseRequest):
@@ -125,31 +162,163 @@ def dry_run(settings: Settings, out: TextIO) -> None:
             f"{BAD_STARTS_PER_MINUTE} bad /start payloads/min per user\n"
         )
         out.write(f"  concurrent updates  {MAX_CONCURRENT_UPDATES}\n")
+        out.write("  single poller       advisory lock per environment, re-checked every ")
+        out.write(f"{Timings().heartbeat_interval:.0f}s (G-ENV-6)\n")
     finally:
         asyncio.run(engine.dispose())
 
 
-def run_polling(settings: Settings) -> None:
-    """Long-poll Telegram until stopped. Never called by tests or the dry run."""
-    from finbot.infra.db.guards import require_environment_marker  # noqa: PLC0415
+def _check_username(app: Application[Any, Any, Any, Any, Any, Any], expected: str | None) -> None:
+    if expected is not None and app.bot.username.lower() != expected.lstrip("@").lower():
+        raise BotStartupError("the bot token belongs to another bot (G-ENV-4)")
 
+
+async def _guard[T](step: Callable[[], Awaitable[T]], what: str) -> T:
+    """Run a start-up step; turn unexpected failures into a refusal naming only the error type."""
+    from finbot.infra.db.guards import EnvironmentMismatchError  # noqa: PLC0415
+    from finbot.infra.db.poller_lock import PollerLockHeldError  # noqa: PLC0415
+
+    try:
+        return await step()
+    except BotStartupError:
+        raise
+    except (EnvironmentMismatchError, PollerLockHeldError) as exc:
+        raise BotStartupError(str(exc)) from None
+    except Exception as exc:  # noqa: BLE001 - reported by type only; messages may hold hosts
+        raise BotStartupError(f"{what} failed ({type(exc).__name__})") from None
+
+
+async def serve(
+    application: Application[Any, Any, Any, Any, Any, Any],
+    *,
+    check_environment: Callable[[], Awaitable[None]],
+    acquire_lock: Callable[[], Awaitable[HeldLock]],
+    expected_username: str | None,
+    stop: asyncio.Event,
+    heartbeat: Heartbeat,
+    timings: Timings = Timings(),  # noqa: B008 - frozen dataclass
+) -> None:
+    """Guards, then poll until ``stop`` is set or the lock is lost (see the module docstring).
+
+    Raises :class:`BotStartupError` if a guard refuses (nothing was polled) and
+    :class:`PollerLockLostError` if the lock was lost while polling (polling was stopped).
+    """
+    heartbeat.write(BotState.STARTING, lock_held=False, polling=False)
+    state = BotState.FAILED
+    try:
+        await _guard(check_environment, "database environment check")
+        lock = await _guard(acquire_lock, "poller lock acquisition")
+        logger.info("poller lock acquired", extra={"event": "poller_lock.acquired"})
+        lost = False
+        try:
+            try:
+                await _guard(application.initialize, "Telegram getMe")
+                _check_username(application, expected_username)
+                if stop.is_set():  # a signal arrived during start-up: never start polling
+                    state = BotState.STOPPED
+                    return
+                await application.start()
+                if application.updater is None:
+                    raise BotStartupError("the application has no updater")
+                await application.updater.start_polling(
+                    allowed_updates=list(ALLOWED_UPDATES), drop_pending_updates=False
+                )
+                heartbeat.write(BotState.READY, lock_held=True, polling=True)
+                logger.info("bot polling started", extra={"event": "bot.polling_started"})
+                lost = await _watch(lock, stop, heartbeat, timings)
+            finally:
+                heartbeat.write(BotState.STOPPING, lock_held=not lost, polling=False)
+                await _stop_application(application)
+        finally:
+            await lock.release()
+            logger.info("poller lock released", extra={"event": "poller_lock.released"})
+        if lost:
+            raise PollerLockLostError("poller lock lost while polling; polling stopped (G-ENV-6)")
+        state = BotState.STOPPED
+    finally:
+        heartbeat.write(state, lock_held=False, polling=False)
+        logger.info("bot stopped", extra={"event": "bot.stopped", "outcome": state.value})
+
+
+async def _watch(
+    lock: HeldLock, stop: asyncio.Event, heartbeat: Heartbeat, timings: Timings
+) -> bool:
+    """Wait for ``stop``; re-check the lock every interval. Returns True if the lock was lost."""
+    while not stop.is_set():
+        try:
+            await asyncio.wait_for(stop.wait(), timings.heartbeat_interval)
+        except TimeoutError:
+            pass
+        else:
+            return False
+        if not await lock.verify():
+            logger.error("poller lock lost; stopping polling", extra={"event": "poller_lock.lost"})
+            return True
+        heartbeat.write(BotState.READY, lock_held=True, polling=True)
+    return False
+
+
+async def _stop_application(application: Application[Any, Any, Any, Any, Any, Any]) -> None:
+    """Stop fetching first, then let in-flight handlers finish, then shut down."""
+    try:
+        if application.updater is not None and application.updater.running:
+            await application.updater.stop()
+        if application.running:
+            await application.stop()
+    finally:
+        await application.shutdown()
+
+
+def install_stop_signals(loop: asyncio.AbstractEventLoop, stop: asyncio.Event) -> None:
+    """SIGTERM (docker stop) and SIGINT (Ctrl-C) request a graceful stop."""
+
+    def request_stop(sig: signal.Signals) -> None:
+        if not stop.is_set():
+            logger.info(
+                "shutdown requested", extra={"event": "bot.shutdown_requested", "outcome": sig.name}
+            )
+        stop.set()
+
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, request_stop, sig)
+
+
+def remove_stop_signals(loop: asyncio.AbstractEventLoop) -> None:
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.remove_signal_handler(sig)
+
+
+def run_polling(
+    settings: Settings,
+    *,
+    health_file: Path | None = None,
+    timings: Timings = Timings(),  # noqa: B008
+) -> None:
+    """Long-poll Telegram until SIGTERM/SIGINT. Never called by tests or the dry run."""
     if settings.telegram_token is None:
         raise BotStartupError("FINBOT_TELEGRAM_TOKEN_FILE is required to run the bot")
     quiet_transport_loggers()
+    asyncio.run(_run(settings, settings.telegram_token.get_secret_value(), health_file, timings))
+
+
+async def _run(settings: Settings, token: str, health_file: Path | None, timings: Timings) -> None:
+    from finbot.infra.db.guards import require_environment_marker  # noqa: PLC0415
+    from finbot.infra.db.poller_lock import PollerLock  # noqa: PLC0415
+
     engine = _engine(settings)
-    application = build_application(
-        settings.telegram_token.get_secret_value(), _services(settings, engine)
-    )
-
-    async def post_init(app: Application[Any, Any, Any, Any, Any, Any]) -> None:
-        await require_environment_marker(engine, settings.env)
-        expected = settings.telegram_expected_bot_username
-        if expected is not None and app.bot.username.lower() != expected.lstrip("@").lower():
-            raise BotStartupError("the bot token belongs to another bot (G-ENV-4)")
-
-    async def post_shutdown(_: Application[Any, Any, Any, Any, Any, Any]) -> None:
+    loop = asyncio.get_running_loop()
+    stop = asyncio.Event()
+    install_stop_signals(loop, stop)
+    try:
+        await serve(
+            build_application(token, _services(settings, engine)),
+            check_environment=lambda: require_environment_marker(engine, settings.env),
+            acquire_lock=lambda: PollerLock.acquire(engine, settings.env),
+            expected_username=settings.telegram_expected_bot_username,
+            stop=stop,
+            heartbeat=Heartbeat(health_file, settings.env),
+            timings=timings,
+        )
+    finally:
+        remove_stop_signals(loop)
         await engine.dispose()
-
-    application.post_init = post_init
-    application.post_shutdown = post_shutdown
-    application.run_polling(allowed_updates=list(ALLOWED_UPDATES), drop_pending_updates=False)

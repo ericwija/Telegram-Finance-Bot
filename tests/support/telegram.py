@@ -5,8 +5,10 @@ recorded and answered locally. Errors are produced the way Telegram produces the
 plus ``{"ok": false, ...}``), so PTB raises its real exception types.
 """
 
+import asyncio
 import itertools
 import json
+from collections.abc import Callable
 from typing import Any
 
 from telegram import Update
@@ -58,6 +60,9 @@ class FakeBotApi(BaseRequest):
         result: Any = True
         if endpoint == "getMe":
             result = _BOT_USER
+        elif endpoint == "getUpdates":  # an idle long poll: no updates, after a short wait
+            await asyncio.sleep(0.01)
+            result = []
         elif endpoint == "sendMessage":
             result = {
                 "message_id": next(_ids),
@@ -74,6 +79,9 @@ class FakeBotApi(BaseRequest):
             for endpoint, p in self.calls
             if endpoint == "sendMessage" and (chat_id is None or p["chat_id"] == chat_id)
         ]
+
+    def count(self, endpoint: str) -> int:
+        return sum(1 for name, _ in self.calls if name == endpoint)
 
     def texts(self, chat_id: int | None = None) -> list[str]:
         return [p["text"] for p in self.sent(chat_id)]
@@ -128,3 +136,10 @@ def added_to_group_update(
     update = Update.de_json(data, app.bot)
     assert update is not None
     return update
+
+
+async def eventually(condition: Callable[[], bool]) -> None:
+    """Wait (up to 10 s) for a condition on state that offers no event to await."""
+    async with asyncio.timeout(10):
+        while not condition():  # noqa: ASYNC110 - polls fakes and pg_locks, which have no event
+            await asyncio.sleep(0.01)

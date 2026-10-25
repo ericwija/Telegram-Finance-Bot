@@ -66,7 +66,7 @@ Targets for the MVP VPS (2 vCPU / 4 GB):
 | NFR-AVL-03 | **RTO ≤ 4 h** to a fresh VPS, following the runbook. |
 | NFR-AVL-04 | Graceful degradation: if AI is unavailable, the local parser is used; if the database is unavailable, the bot replies "Layanan sedang gangguan" and does not lose drafts already stored. |
 | NFR-AVL-05 | Restart safety: drafts and conversation state live in PostgreSQL, so a container restart loses no confirmed or pending data. |
-| NFR-AVL-06 | Only one bot poller runs per token. A startup lock (`pg_try_advisory_lock`) prevents a second instance. |
+| NFR-AVL-06 | Only one bot poller runs per token. A startup lock (`pg_try_advisory_lock`, keyed by environment, so one per token through G-ENV-4) prevents a second instance. The lock is held on a dedicated connection and re-checked while polling, and losing it stops polling (doc 04 §5.8). |
 
 ## 6. Observability (`OBS`)
 
