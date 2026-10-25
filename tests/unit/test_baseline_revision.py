@@ -1,4 +1,4 @@
-"""Static checks of the Phase 1 baseline revision through its offline SQL (no database).
+"""Static checks of the Phase 1 baseline revision (0001) through its offline SQL (no database).
 
 The rendered SQL is what a reviewer (or the approved offline fallback, docs/10 §3) would see, so
 these checks run on it: the guard comes first, the marker matches FINBOT_ENV, every table gets
@@ -30,7 +30,7 @@ def _sql(monkeypatch: pytest.MonkeyPatch, env: str, *argv: str, downgrade: bool 
 
 @pytest.fixture
 def upgrade_sql(monkeypatch: pytest.MonkeyPatch) -> str:
-    return _sql(monkeypatch, "staging", "upgrade", "head")
+    return _sql(monkeypatch, "staging", "upgrade", "0001")
 
 
 def test_guard_runs_before_any_schema_change(upgrade_sql: str) -> None:
@@ -47,7 +47,7 @@ def test_environment_marker_matches_the_target_environment(
     upgrade_sql: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     assert "VALUES ('environment', 'staging')" in upgrade_sql
-    assert "VALUES ('environment', 'drill')" in _sql(monkeypatch, "drill", "upgrade", "head")
+    assert "VALUES ('environment', 'drill')" in _sql(monkeypatch, "drill", "upgrade", "0001")
 
 
 def test_sql_is_psql_safe(upgrade_sql: str) -> None:

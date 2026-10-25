@@ -1,6 +1,6 @@
 """Lifecycle of the Phase 1 baseline revision on a real PostgreSQL 18.6 (docs/10 §3, S9).
 
-Upgrade to head records the environment marker and leaves everything owned by finbot_owner; a
+Upgrade to 0001 records the environment marker and leaves everything owned by finbot_owner; a
 second upgrade is a no-op that still runs the guard; a downgrade (test environment, explicit
 opt-in) removes every object and privilege change, and the chain upgrades again cleanly.
 Runs only with FINBOT_TEST_PG_BACKEND set.
@@ -20,6 +20,7 @@ from tests.support import pg
 
 pytestmark = pytest.mark.db
 
+BASELINE = "0001"
 PHASE1_TABLES = {"users", "workspaces", "workspace_memberships", "audit_events", "platform_meta"}
 
 
@@ -89,7 +90,7 @@ def _with_downgrade(config: Config, settings: Any) -> Config:
 def test_upgrade_creates_the_phase1_baseline_owned_by_finbot_owner(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, BASELINE)
     state = _state(pg_cluster, test_database)
     assert state["tables"] == PHASE1_TABLES | {"alembic_version"}
     assert state["version"] == ["0001"]
@@ -116,18 +117,18 @@ def test_upgrade_creates_the_phase1_baseline_owned_by_finbot_owner(
 def test_second_upgrade_is_a_noop_and_still_checks_the_marker(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
-    command.upgrade(alembic_config, "head")
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, BASELINE)
+    command.upgrade(alembic_config, BASELINE)
     assert _state(pg_cluster, test_database)["version"] == ["0001"]
     _query(pg_cluster, test_database, "UPDATE platform_meta SET value = 'staging'")
     with pytest.raises(Exception, match="environment marker is not test"):
-        command.upgrade(alembic_config, "head")
+        command.upgrade(alembic_config, BASELINE)
 
 
 def test_downgrade_is_refused_without_opt_in_and_changes_nothing(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, BASELINE)
     before = _state(pg_cluster, test_database)
     with pytest.raises(Exception, match="forward fixes"):
         command.downgrade(alembic_config, "base")
@@ -141,10 +142,10 @@ def test_downgrade_removes_everything_and_the_chain_upgrades_again(
     test_database: str,
 ) -> None:
     pristine = _state(pg_cluster, test_database)  # empty database, before any migration
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, BASELINE)
     command.downgrade(_with_downgrade(alembic_config, migration_settings), "base")
     after = _state(pg_cluster, test_database)
     # alembic_version itself stays (empty), as it would after any downgrade to base.
     assert after == {**pristine, "tables": {"alembic_version"}, "version": []}
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, BASELINE)
     assert _state(pg_cluster, test_database)["tables"] == PHASE1_TABLES | {"alembic_version"}

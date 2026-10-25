@@ -17,6 +17,8 @@ pytestmark = [pytest.mark.db, pytest.mark.asyncio]
 
 RLS_TABLES = ("users", "workspaces", "workspace_memberships", "audit_events")
 NON_RLS_TABLES = {"alembic_version", "platform_meta"}  # no tenant data; app access is SELECT-only
+# Revision 0002 (head): RLS + FORCE + a deny-all policy, no app grants (docs/09 §4.3).
+IDENTITY_TABLES = ("telegram_identities", "onboarding_invites")
 INSERT_MEMBER = "INSERT INTO workspace_memberships (workspace_id, workspace_kind, user_id, role) "
 
 
@@ -422,7 +424,7 @@ async def test_AT_RLS_COVERAGE_phase1(migrated_database: str, owner_engine: Any)
                WHERE n.nspname = 'public' AND c.relkind IN ('r', 'p')""",
         )
     names = {t.relname for t in tables}
-    assert names == set(RLS_TABLES) | NON_RLS_TABLES
+    assert names == set(RLS_TABLES) | set(IDENTITY_TABLES) | NON_RLS_TABLES
     for t in tables:
         if t.relname in NON_RLS_TABLES:
             continue
@@ -470,7 +472,12 @@ async def test_AT_RLS_05_app_and_backup_privileges(
         assert await check(
             "SELECT has_table_privilege('finbot_app', 'public.platform_meta', 'SELECT')"
         )
-        for table in (*RLS_TABLES, *NON_RLS_TABLES):  # complete dumps
+        for table in IDENTITY_TABLES:  # only through the SECURITY DEFINER functions
+            for priv in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE", "REFERENCES"):
+                assert not await check(
+                    f"SELECT has_table_privilege('finbot_app', 'public.{table}', '{priv}')"
+                ), (table, priv)
+        for table in (*RLS_TABLES, *IDENTITY_TABLES, *NON_RLS_TABLES):  # complete dumps
             assert await check(
                 f"SELECT has_table_privilege('finbot_backup', 'public.{table}', 'SELECT')"
             ), table
@@ -498,17 +505,21 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "app_is_active_member",
         "business_has_owner",
         "personal_membership_is_owner",
+        "redeem_onboarding_invite",
+        "resolve_principal",
     }
     for f in functions:
         assert f.owner == "finbot_owner"
         assert f.proconfig == ["search_path=pg_catalog, public"], f.proname
         assert "PUBLIC" not in f.executors, f.proname
-        assert f.returns in ("boolean", "trigger"), f.proname
+        assert f.returns in ("boolean", "trigger", "record", "uuid"), f.proname
     executors = {f.proname: set(f.executors) - {"finbot_owner"} for f in functions}
     assert executors == {
         "app_is_active_member": {"finbot_app"},
         "business_has_owner": set(),
         "personal_membership_is_owner": set(),
+        "redeem_onboarding_invite": {"finbot_app"},
+        "resolve_principal": {"finbot_app"},
     }
 
 

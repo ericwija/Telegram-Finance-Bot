@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) and **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9). Awaiting owner review; CI has not run |
+| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9) and **Step 4A** (revision `0002`, identity and onboarding; §10). Step 4A awaits owner review |
 | **Date** | 2026-10-24 |
 | **Decisions** | S1–S11 approved 2026-10-24 (§8); D9, D18, D24 (doc 01 §8) |
 | **Related** | [04 Architecture](04-LOGICAL-ARCHITECTURE.md) §8 · [05 Data Model](05-DATA-MODEL.md) §8, §11 · [07 Tests](07-TEST-AND-ACCEPTANCE-PLAN.md) · [09 Security](09-TENANT-ISOLATION-AND-SECURITY.md) |
@@ -306,3 +306,28 @@ Without `LD_LIBRARY_PATH`, `ldd` reports `liburing.so.2 => not found`. That is e
 7. **The two membership trigger functions are `SECURITY DEFINER`** (fixed `search_path`, no `EXECUTE` grants), so their checks see the rows they need whatever the caller's RLS context. The audit trigger function runs as the invoker.
 
 Tests: `tests/integration/test_rls_phase1_db.py` (AT-RLS-00…07, AT-RLS-COVERAGE, S5–S7, integrity triggers), `tests/migration/test_baseline_migration_db.py` (lifecycle), `tests/unit/test_baseline_revision.py` (offline SQL, no database).
+
+## 10. Identity and onboarding (revision `0002`, Step 4A)
+
+`migrations/versions/0002_identity_onboarding.py` implements the identity part of the P2 row of doc 05 §11 and the two identity functions of doc 09 §4.3. It is the narrow bootstrap that §9 items 1 and 4 call for, for onboarding only: business-workspace creation is still open.
+
+| Area | What `0002` does |
+|---|---|
+| Tables | `telegram_identities` (one active binding per Telegram account and per user; `telegram_user_id > 0`) and `onboarding_invites` (`token_hash` = 32-byte SHA-256, unique; `used_at`/`used_by` consistent), as in doc 05 §3 with `uuidv7()` defaults |
+| Access | **No grants to `finbot_app`** on either table (doc 09 §4.3). RLS ENABLE + FORCE and a deny-all `no_direct_access` policy, so an accidental future grant still exposes nothing. `finbot_backup` reads them through the default privileges |
+| `resolve_principal(tg_user_id bigint)` | `SECURITY DEFINER`, `STABLE`, owner `finbot_owner`, `search_path = pg_catalog, public`; returns only `(user_id, status, is_platform_admin)` for an active (not unlinked) binding. `EXECUTE` for `finbot_app` only |
+| `redeem_onboarding_invite(token_hash bytea, tg_user_id bigint, display_name text)` | `SECURITY DEFINER`, same owner and `search_path`, `EXECUTE` for `finbot_app` only. Validates its arguments (raises on a bad digest, ID or name, before any write). Takes a transaction-scoped advisory lock per Telegram account, then locks the invite `FOR UPDATE`. An account that is already linked gets its existing user ID back and the invite is not touched. Otherwise a refused invite (unknown, used, revoked or expired) writes one `onboarding_invite.failed` audit row with the reason and returns NULL. A valid invite creates the user, the identity, the personal workspace `Pribadi` and its owner membership, marks the invite used, and writes `onboarding_invite.redeemed`, `user.onboarded`, `identity.linked` (platform-level) and `workspace.created` (in the new workspace), all in the caller's transaction. It accepts no workspace, role or user ID |
+
+Application side: `domain/identity.py` (token parsing, SHA-256, display-name normalisation), `ports/identity.py`, `infra/db/identity.py` (calls only the two functions; reads the personal workspace with `app.user_id` set, under RLS), `services/onboarding.py` (`/start` outcomes), and `adapters/telegram/{start.py,messages_id.py}` (framework-independent `/start` handler and Indonesian messages).
+
+**Interpretations and limits** (owner review requested):
+
+1. **D6 is still open in doc 01 §8.** This implements its documented default (a), single-use invite codes, because FR-IDN-01, doc 05 and doc 09 are all written for it.
+2. **FR-IDN-04 seeds are deferred.** The "Kas" account and default categories need Phase 3 tables (`accounts`, `categories`). Phase 3 must add them to `redeem_onboarding_invite` in the revision that creates those tables.
+3. **The personal workspace is named `Pribadi`.** No document fixes the name; it is the only literal default in the function.
+4. **The display name falls back to `Pengguna`** when the Telegram first name has nothing printable. Control and Unicode format characters (including bidi overrides) are removed, whitespace is collapsed, and the result is cut to 64 characters.
+5. **Malformed `/start` payloads** (not `onb_` followed by 22 to 60 URL-safe characters) are treated as "no invite". They are not sent to the database and not audited; only well-formed tokens that fail are audited.
+6. **A failed-invite audit row records only the reason**, not the Telegram user ID, to keep identifiers of people who were never onboarded out of the audit log.
+7. **Not implemented yet:** invite creation and revocation (FR-IDN-01 CLI; `created_by` needs an existing platform-admin user, so bootstrapping the first admin is an open decision), the `/start` rate limit (T17, AT-TOK-04), `telegram_username` (the documented signature has no parameter for it), `user_preferences.active_workspace_id` (the personal workspace is shown as the active one), and the main menu (FR-IDN-07; no features exist yet). The Telegram framework is not wired in: `python-telegram-bot` is not a dependency, and adding it needs approval (Phase 1 Step 4).
+
+Tests: `tests/integration/test_onboarding_db.py` (first and repeat onboarding, refusals and their audit, concurrent redeems for one account and for one invite, rollback inside the function and by the caller, argument validation, tenant isolation, no direct table access, function privileges), `tests/migration/test_identity_migration_db.py` (0001 ↔ 0002 lifecycle, head → base), `tests/unit/test_identity_revision.py` (offline SQL), `tests/unit/test_identity_domain.py`, `tests/unit/test_onboarding_service.py`. The Phase 1 tests now pin revision `0001` where they test the baseline alone, and AT-RLS-COVERAGE, AT-RLS-05 and AT-RLS-06 include the identity tables and functions.
