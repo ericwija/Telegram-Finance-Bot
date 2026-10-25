@@ -69,6 +69,8 @@ CREATE POLICY tenant_isolation ON transactions
   WITH CHECK (workspace_id = app_workspace_id());
 ```
 
+**Implemented in revision `0004` (Step 6)** for `accounts`, `categories`, `transactions`, `transaction_entries`, `transaction_revisions`, `drafts` and `pending_actions`. The policy also requires an active membership: `USING / WITH CHECK (workspace_id = app_workspace_id() AND app_is_active_member(workspace_id))`. `drafts` and `pending_actions` add `AND user_id = app_user_id()`, so a draft is visible only to its creator (R-9). The ledger trigger functions `ledger_entries_balanced`, `ledger_entry_active_account` and `ledger_txn_active_category` are `SECURITY DEFINER` so that they read the rows they check whatever the caller's context. They are executable by nobody directly, and AT-RLS-06 keeps the definer inventory exact. Details: doc 10 §12.
+
 ### 4.3 Tenancy and identity tables
 
 | Table | Policy |
@@ -128,7 +130,7 @@ CREATE POLICY tenant_isolation ON transactions
 | Identity | `user.onboarded`, `user.suspended`, `user.reactivated`, `user.anonymized`, `identity.linked`, `identity.unlinked`, `onboarding_invite.created/revoked/redeemed/failed`, `platform_admin.bootstrapped` (once per database, doc 10 §11) |
 | Workspace | `workspace.created`, `workspace.updated`, `workspace.deletion_requested`, `workspace.deletion_cancelled`, `workspace.purged`, `workspace.ownership_transfer_initiated/accepted/declined/expired` |
 | Members | `invitation.created/revoked/accepted/failed`, `member.role_changed`, `member.removed`, `member.left` |
-| Ledger | `account.created/updated/archived/unarchived`, `category.created/updated/archived`, `transaction.created/updated/voided/restored/type_changed`, `draft.created/confirmed/cancelled/expired` (drafts: counts only, sampled) |
+| Ledger | `account.created/updated/archived/unarchived`, `category.created/updated/archived/unarchived`, `transaction.created/updated/voided/restored/type_changed`, `draft.created/confirmed/cancelled/expired` (drafts: counts only, sampled) |
 | Data access | `report.exported` (period and row count), `audit.viewed` |
 | Security | `security.authz_denied`, `security.cross_tenant_probe`, `security.rate_limited`, `security.break_glass_started/ended` |
 | Operations | `backup.completed/failed`, `restore.performed`, `import.batch_dry_run/applied`, `ai.budget_exceeded` |

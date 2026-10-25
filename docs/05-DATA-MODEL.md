@@ -557,6 +557,6 @@ Reconciliation output (`import_batches.stats`): for each user, rows read, import
 | **P4** | `ai_usage`; receipt extraction columns, if any are deferred from P3 |
 | **P7** | `import_batches` |
 
-The P1 row is implemented by revision `0001` (Step 3B.3); doc 10 §9 lists where it interprets this document. Of the P2 row, `telegram_identities`, `onboarding_invites`, `resolve_principal` and `redeem_onboarding_invite` are implemented by revision `0002` (Step 4A, doc 10 §10); the rest of the row is not yet built.
+The P1 row is implemented by revision `0001` (Step 3B.3); doc 10 §9 lists where it interprets this document. Of the P2 row, `telegram_identities`, `onboarding_invites`, `resolve_principal` and `redeem_onboarding_invite` are implemented by revision `0002` (Step 4A, doc 10 §10); the rest of the row is not yet built. Of the P3 row, revision `0004` (Step 6) creates `accounts`, `categories`, `transactions`, `transaction_entries`, `transaction_revisions`, `drafts`, `pending_actions` (moved here from P2 for category prompts), `current_entries`, the §5.2 triggers and `workspace_memberships.default_account_id`. It adds `transactions.currency` (IDR only, so reports group by currency), `drafts.purpose`/`target_transaction_id` (edit drafts) and `pending_actions.status`, and defers `receipts`, `receipt_id`, `import_ref` and `replaces_transaction_id` to later expand-only revisions. Details and reasons: doc 10 §12.
 
 Role passwords are not set by migrations. They are set from Docker secrets by the database init step (doc 04 §8.2).

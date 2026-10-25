@@ -45,11 +45,15 @@ from finbot.adapters.telegram.bot import (
     build_application,
     quiet_transport_loggers,
 )
+from finbot.adapters.telegram.finance import FinanceServices
 from finbot.adapters.telegram.ratelimit import BAD_STARTS_PER_MINUTE, UPDATES_PER_MINUTE
 from finbot.config import STRICT_ENVIRONMENTS, Settings
 from finbot.infra.heartbeat import BotState, Heartbeat
+from finbot.services.capture import CaptureService
+from finbot.services.ledger import LedgerService
 from finbot.services.onboarding import OnboardingService
 from finbot.services.platform_invites import PlatformInviteService
+from finbot.services.principals import PrincipalService
 
 logger = logging.getLogger(__name__)
 
@@ -104,14 +108,21 @@ class OfflineRequest(BaseRequest):
 
 
 def _services(settings: Settings, engine: Any) -> BotServices:
+    from finbot.infra.db.finance import PgFinanceStore  # noqa: PLC0415
     from finbot.infra.db.identity import PgIdentityGateway  # noqa: PLC0415
     from finbot.infra.db.platform import PgPlatformGateway  # noqa: PLC0415
 
     identities = PgIdentityGateway(engine)
+    store = PgFinanceStore(engine)
     return BotServices(
         onboarding=OnboardingService(identities),
         invites=PlatformInviteService(identities, PgPlatformGateway(engine)),
         timezone=settings.default_timezone,
+        finance=FinanceServices(
+            principals=PrincipalService(identities),
+            ledger=LedgerService(store),
+            capture=CaptureService(store),
+        ),
     )
 
 

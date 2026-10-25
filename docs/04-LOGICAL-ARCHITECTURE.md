@@ -235,6 +235,38 @@ Replies are HTML with every interpolated value escaped, and link previews off. T
 - A "poller lock held" refusal means another instance is live. Find it, and never work around the lock.
 - The in-memory duplicate and rate-limit state (`ratelimit.py`) relies on this single process.
 
+### 5.9 Finance core (Step 6, revision `0004`)
+
+**Modules** (layering of §3 enforced by import-linter):
+
+| Layer | Module | Role |
+|---|---|---|
+| domain | `money.py`, `ledger.py`, `finance.py` | Whole-rupiah parsing and formatting; the entry sign rules (`build_entries`); names, dates and months in the workspace timezone; filters and report values; the capture and edit state machines. Pure |
+| authz | `permissions.py`, `policy.py`, `context.py` | The docs/08 matrix (`ROLE_PERMISSIONS`, personal and read-only overlays) and `authorize()`; `WorkspaceContext` built from the membership read in the request's transaction |
+| ports | `finance.py` | `FinanceStore.session(user, workspace, write)` = one unit of work (§5.3) plus `record_denial` |
+| infra | `db/finance.py` | PostgreSQL implementation: sets `app.user_id`, loads the **active** membership (`FOR SHARE` for writes), sets `app.workspace_id`, then bound-parameter queries with explicit workspace filters on top of RLS |
+| services | `finance.py`, `ledger.py`, `capture.py`, `principals.py` | Authorized sessions, idempotent seeding and the ledger writes; categories, history, detail, corrections, void/restore, reports; the capture and edit conversations persisted as drafts; Telegram sender → user |
+| adapters | `telegram/finance.py`, `finance_render.py`, `finance_callbacks.py` | Handlers (one service call each), HTML rendering with escaping, strict callback codec |
+
+**Request flow** for every finance update: gate (§5.8) → `PrincipalService.actor` (`resolve_principal`; unknown → onboarding text, suspended → refused) → one service method → `_session()` opens the unit of work and runs `authorize()` with the current membership, inside the same database transaction as the change (G-2), seeds defaults if missing, and commits. A `ForbiddenError` rolls back and writes `security.authz_denied` in its own short transaction (G-4). The adapter renders the result or maps an expected error to the catalogue.
+
+**Conversation flow** (`/catat`, `/pemasukan`, `/pengeluaran`; drafts in PostgreSQL):
+
+```
+/catat ──► [Pemasukan|Pengeluaran] ──► amount (text) ──► [category buttons] ──► description (text | Lewati)
+                                                                                        │
+          ✅ Simpan ◄── summary: workspace (G-8), type, amount, category, description, date ──┘
+             │            └─ 📅 Tanggal ─► date (text) ─► summary          ❌ Batal / /batal at any step
+             ▼
+ "✅ Tersimpan …" (the same message is edited, so its buttons disappear)
+```
+
+`/pengeluaran 25rb makan siang` fills the amount and description and goes straight to the category step. `/riwayat` lists ten transactions per page with number buttons. Each detail offers ✏️ Ubah (amount, category, description, date; an edit draft with its own confirmation), 🗑️ Hapus (with a confirmation) and ♻️ Pulihkan, each only if the caller's role allows it. `/kategori` lists categories and offers create, rename (pending action plus a typed name) and activate/deactivate. `/saldo` shows recorded balances per account, labelled as not being a bank statement; `/laporan [bulan]` shows a monthly summary.
+
+**Buttons** carry only a short draft reference, a transaction or category ID with its version, a page, or filters, never a workspace (docs/09 L1). The services look every ID up inside the active workspace, so a forged, stale or foreign button gets "not found", "kedaluwarsa" or "sudah berubah" and acts on nothing. Malformed data is answered as a stale button without touching the database.
+
+**Errors.** Expected outcomes map to catalogue messages: not found (G-3), not permitted (G-4), expired, stale version, duplicate name, invalid input with a specific reason, use the buttons. They are logged as `finance.refused` with the error type only. Anything else reaches the application error handler: type-only log, generic reply. No message text, description, amount or token is ever logged (AT-LOG-01). The runtime keeps the `telegram` and `httpx` loggers at WARNING because their DEBUG output contains Bot API parameters.
+
 ## 6. Request flows
 
 ### 6.1 Text capture → confirm

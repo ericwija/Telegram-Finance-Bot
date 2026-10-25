@@ -2,8 +2,8 @@
 
 | | |
 |---|---|
-| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9) **Step 4A** (revision `0002`, identity and onboarding; §10) and **Step 4B** (revision `0003`, platform-admin bootstrap and invites; §11). Step 4B awaits owner review |
-| **Date** | 2026-10-24 |
+| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9) **Step 4A** (revision `0002`, identity and onboarding; §10) **Step 4B** (revision `0003`, platform-admin bootstrap and invites; §11) and **Step 6** (revision `0004`, ledger core; §12). Step 6 awaits owner review |
+| **Date** | 2026-10-25 |
 | **Decisions** | S1–S11 approved 2026-10-24 (§8); D9, D18, D24 (doc 01 §8) |
 | **Related** | [04 Architecture](04-LOGICAL-ARCHITECTURE.md) §8 · [05 Data Model](05-DATA-MODEL.md) §8, §11 · [07 Tests](07-TEST-AND-ACCEPTANCE-PLAN.md) · [09 Security](09-TENANT-ISOLATION-AND-SECURITY.md) |
 
@@ -370,3 +370,132 @@ All commands run where the respective credentials are mounted (Step 5: the one-s
 5. **Not implemented:** the bot-DM channel for invites (docs/08 §3.3 "+ bot DM"; the functions already accept channel `telegram`), suspend/reactivate (FR-IDN-06), and a full `authz/policy.py` (the platform check lives in the service for now).
 
 Tests: `tests/integration/test_platform_admin_db.py`, `tests/migration/test_platform_admin_migration_db.py` (CLI end to end, `0003` lifecycle, marker kept across downgrade), `tests/unit/test_admin_revision.py`, `tests/unit/test_platform_invites.py`. AT-RLS-06 includes the three invite functions.
+
+## 12. Ledger core (revision `0004`, Step 6)
+
+Revision `0004_ledger_core` implements the finance part of the P3 row of doc 05 §11: `accounts`, `categories`, `transactions` (header), `transaction_entries` (D1), `transaction_revisions`, `drafts`, `pending_actions`, the `current_entries` view, the doc 05 §5.2 triggers, and `workspace_memberships.default_account_id` with its composite FK. It is **additive**: new tables, one new nullable column, grants. No existing row is read or rewritten, so it is safe on a database that already has users and workspaces. Workspaces created before `0004` get their finance defaults the first time they use a finance feature (§12.2).
+
+### 12.1 Schema, as implemented
+
+| Object | Notes |
+|---|---|
+| `accounts` | As doc 05 §5.1. `UNIQUE (workspace_id, id)`; active names unique case-insensitively (`lower(name)`). Only the seeded "Kas" is created in this step |
+| `categories` | As doc 05 §5.1, plus `created_by`, `version` and two CHECKs: the name is trimmed (`name = btrim(name)`), and the default (`Lainnya`) category cannot be archived. `UNIQUE (workspace_id, id, kind)` is the target of the kind-matching FK from `transactions`. Active names unique per kind with `lower(name)`; one default per kind |
+| `transactions` | As doc 05 §5.2, plus **`currency text NOT NULL DEFAULT 'IDR' CHECK (currency = 'IDR')`** (reports group by it, so currencies can never be summed together), `CHECK (txn_date >= '2000-01-01')`, `description` 1–500 characters (empty is stored as NULL), `version >= 1`. **Not yet created** (added by later expand-only revisions): `receipt_id` and the `receipts` table (Phase 4), `import_ref` (Phase 7), `replaces_transaction_id` (D21 type change, not built yet). Indexes: `ix_txn_ws_date`, `ix_txn_ws_category` (posted only) and `ix_txn_ws_history (workspace_id, status, txn_date DESC, id DESC)` for paging |
+| `transaction_entries` | As doc 05 §5.2 (signed `bigint`, leg/sign CHECK, composite FKs to the header *with its type* and to the account, one leg per revision, two distinct accounts per revision) |
+| `transaction_revisions` | As doc 05 §5.2. `snapshot` holds structured fields only (`has_description`, never the text) |
+| `drafts` | As doc 05 §5.3 without `batch_id`, `receipt_id` and `prompt_version` (AI and receipts are Phase 4), plus `purpose` (`create`/`edit`), `target_transaction_id` (edit drafts; composite FK), `updated_at`, and **`uq_drafts_one_pending (workspace_id, user_id) WHERE status = 'pending'`**: one conversation per user and workspace |
+| `pending_actions` | As doc 05 §5.3 plus `status` (`pending`/`completed`/`cancelled`/`expired`) and a `kind` CHECK (`category_create`, `category_rename`); one pending action per user and workspace |
+| `current_entries` | `security_invoker` view as doc 05 §5.2, plus `t.currency` |
+| `workspace_memberships.default_account_id` | Nullable, FK `(workspace_id, default_account_id)` → `accounts` (FR-ACC-05) |
+
+Triggers (functions owned by `finbot_owner`, `SET search_path = pg_catalog, public`, `EXECUTE` revoked from PUBLIC and granted to nobody):
+
+| Trigger | Function | Enforces |
+|---|---|---|
+| `trg_entries_balanced` (2 constraint triggers, **DEFERRABLE INITIALLY DEFERRED**: on entry INSERT and on header INSERT/UPDATE OF `amount, entry_revision, type`) | `ledger_entries_balanced()`, `SECURITY DEFINER` (sees every entry of one transaction whatever the caller's RLS context; reads by transaction ID only) | INV-2…INV-4 at COMMIT; no entry set beyond `entry_revision`. A header without entries, a one-legged or unbalanced transfer, or an entry that disagrees with the header never commits |
+| `trg_entries_immutable`, `trg_entries_no_truncate`, `trg_revisions_immutable`, `trg_revisions_no_truncate` | `ledger_append_only()` (invoker) | INV-6: UPDATE, DELETE and TRUNCATE refused unless `session_user = 'finbot_owner'` (S6; purge only) |
+| `trg_txn_type_immutable` | `ledger_txn_type_immutable()` (invoker) | D21(a): `type` never changes, for the owner too |
+| `trg_entries_active_account` | `ledger_entry_active_account()`, definer (reads one account by key) | R-10: no new entry on an archived account |
+| `trg_txn_active_category` | `ledger_txn_active_category()`, definer (reads one category by key) | R-10, FR-CAT-04: an archived category is never newly set; existing rows keep it |
+
+RLS (D5): every new table is `ENABLE` + `FORCE` with policy `tenant_isolation`: `workspace_id = app_workspace_id() AND app_is_active_member(workspace_id)`, for `USING` and `WITH CHECK`. `drafts` and `pending_actions` add `AND user_id = app_user_id()` (R-9: a draft is visible only to its creator). A `pending_actions` row with `workspace_id IS NULL` is invisible to the app (no user-level kinds exist yet).
+
+Grants to `finbot_app` (S7): `SELECT, INSERT` on all seven tables; column-level `UPDATE` only on mutable columns (never `id`, `workspace_id`, `type`, `currency`, `created_*`, `kind`); **no UPDATE on `transaction_entries` and `transaction_revisions`**, and no DELETE or TRUNCATE anywhere; `UPDATE (default_account_id)` on memberships; `SELECT` on `current_entries`. `finbot_backup` reads everything through the default privileges of revision `0001`.
+
+### 12.2 Seeding (FR-IDN-04, FR-CAT-01, FR-ACC-05)
+
+The defaults live in application code (`domain/finance.py`: `DEFAULT_CATEGORIES`, `DEFAULT_ACCOUNT_*`), not in a migration or in the onboarding function. The first finance request of a member whose `default_account_id` is NULL, in an **active** workspace, runs `services/finance.py::ensure_finance_defaults` in its own transaction:
+
+1. if the workspace has no category at all (archived ones count), insert the documented FR-CAT-01 lists: income Gaji, Bonus, Penjualan, Investasi, Hadiah, Lainnya; expense Makanan, Transportasi, Belanja, Tagihan, Kesehatan, Pendidikan, Hiburan, Iuran, Lainnya (`Lainnya` is the default of each kind);
+2. if it has no active account, insert "Kas" (`cash`, opening balance 0, opening date 2000-01-01 so that back-dated entries count);
+3. set the member's default account to the oldest active account.
+
+Every insert is `ON CONFLICT DO NOTHING` against the unique indexes, so concurrent first requests seed exactly once (tested with five concurrent requests). Each inserted row is audited (`category.created` / `account.created`, `actor_kind = 'system'`, `seeded: true`). This is why the migration needs no data step. The Step 6 request listed slightly different default names. The approved document wins, and only the code list needs changing if the owner wants otherwise.
+
+### 12.3 Money, dates and currency
+
+- **Representation:** whole rupiah as `bigint` in the database and `int` in Python (G-6, CLAUDE.md rule 3; IDR has scale 0). No `float` or `Decimal` exists in any money path.
+- **Input:** `domain/money.py::parse_amount` accepts `25000`, `25.000`, `25,000`, `Rp 1.250.000`, `25rb`, `1,5jt`, `2 juta` and similar. A fraction is rounded **half-up** with integer arithmetic, and the user is told. Zero, negative and out-of-range (above 10^12) inputs are refused; the transaction type alone decides the direction.
+- **Aggregation:** sums are SQL `SUM(bigint)`, which PostgreSQL computes exactly as `numeric`, converted back to `int`.
+- **Currency:** each header carries `currency` (IDR only, enforced by a CHECK). Reports and balances are grouped by currency and never added across currencies.
+- **Dates:** a transaction date is a business date in the workspace timezone (G-7), between 2000-01-01 and today. Back-dating is allowed and flagged in the audit (`back_dated`; D17). Technical instants are UTC `timestamptz`.
+
+### 12.4 Transaction lifecycle
+
+```
+draft (pending) ──✅ confirm──► transaction (posted, v1, entries rev 1)
+   │  ❌ cancel / new conversation → cancelled          │ edit amount → v+1, entries rev+1 (old set kept)
+   │  24 h → expired                                    │ edit category/description/date → v+1
+   │  member downgraded/removed → expired / refused     ▼
+   └────────────────────────────────────────── void ("hapus") ⇄ restore (v+1 each; entries untouched)
+```
+
+- **Confirm** locks the draft row (`FOR UPDATE`), writes the header, its entries, a revision and the audit event, and sets `drafts.status = 'confirmed'` in one transaction. A second confirm (double tap, Telegram retry, a concurrent press) finds the draft already confirmed and reports the same transaction: exactly one is stored (AT-TXN-IDEMP-01). Permission is checked at that moment (G-2, R-9).
+- **Edit** and **void/restore** use optimistic locking (`version`). A stale button or draft is refused and the user reopens the latest version (AT-TXN-OCC-01).
+- **Void** is the application's reversible delete: the transaction stops counting in balances, history and reports, and stays restorable from `/riwayat dihapus`. **A migration downgrade is a different thing:** dropping `0004` drops every finance table and its data. Downgrades are refused in staging and production (S9), and recovering from a bad schema change means restoring a backup (§12.6).
+
+### 12.5 Verification after `upgrade 0004` (read-only, as `finbot_owner`)
+
+These use the `owner_psql` helper of `deploy/staging/README.md` §7:
+
+```sql
+SELECT version_num FROM public.alembic_version;                                   -- 0004
+-- Every ledger table has RLS ENABLE + FORCE and its policy: expect 7 rows, all t / t / 1.
+SELECT c.relname, c.relrowsecurity, c.relforcerowsecurity,
+       (SELECT count(*) FROM pg_policy p WHERE p.polrelid = c.oid) AS policies
+FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+WHERE n.nspname = 'public' AND c.relname IN ('accounts', 'categories', 'transactions',
+  'transaction_entries', 'transaction_revisions', 'drafts', 'pending_actions') ORDER BY 1;
+-- The app can never rewrite money movements or the type: expect f f f f f.
+SELECT has_table_privilege('finbot_app', 'public.transaction_entries', 'UPDATE'),
+       has_table_privilege('finbot_app', 'public.transaction_entries', 'DELETE'),
+       has_table_privilege('finbot_app', 'public.transaction_revisions', 'UPDATE'),
+       has_column_privilege('finbot_app', 'public.transactions', 'type', 'UPDATE'),
+       has_table_privilege('finbot_app', 'public.transactions', 'DELETE');
+-- The deferred balance check and the immutability triggers exist: expect 9 rows.
+SELECT tgrelid::regclass, tgname, tgdeferrable FROM pg_trigger
+WHERE tgname LIKE 'trg_entries%' OR tgname LIKE 'trg_revisions%' OR tgname LIKE 'trg_txn%'
+ORDER BY 1, 2;
+-- No ledger function is executable by PUBLIC or the app: expect 0 rows.
+SELECT p.proname FROM pg_proc p
+WHERE p.proname LIKE 'ledger\_%' AND (has_function_privilege('finbot_app', p.oid, 'EXECUTE')
+   OR has_function_privilege('public', p.oid, 'EXECUTE'));
+-- Existing data untouched; nothing seeded yet: expect the old counts, 0 and 0.
+SELECT (SELECT count(*) FROM public.users) AS users,
+       (SELECT count(*) FROM public.workspace_memberships WHERE default_account_id IS NOT NULL) AS defaults,
+       (SELECT count(*) FROM public.transactions) AS transactions;
+```
+
+After the first finance command of a test account, its workspace has 15 categories and one "Kas" account, and its membership has a default account.
+
+### 12.6 Proposed staging deployment of Step 6 (operator-controlled; nothing here has been run)
+
+Each step needs owner approval, and is run by `deploy` per `deploy/staging/README.md`.
+
+1. **Backup** (README §12.1). Record the file name. This is the rollback point for the schema.
+2. **Build** the image from the reviewed commit (README §6.2) and run the offline smoke tests. `finbot bot --dry-run` should now list `/catat … /riwayat … /saldo … /laporan … /kategori` and `callback_query`.
+3. **Stop the bot** (README §11: `stop bot`). The migration takes a brief `ACCESS EXCLUSIVE` lock on `workspace_memberships` (ADD COLUMN, ADD CONSTRAINT) under `lock_timeout = 10s`. Stopping the bot avoids waiting behind it. The Step 5 code would keep working on the new schema (additive), but the Step 6 code needs `0004`.
+4. **Review the SQL**: `docker compose -f $F run --rm --no-deps migrate sql upgrade 0003:0004` (README §7.2), then **apply**: `docker compose -f $F run --rm migrate upgrade 0004` (one transaction; a non-zero exit leaves the database unchanged).
+5. **Verify** with §12.5.
+6. **Start the new image**: `up -d bot` (README §9.2); wait for the healthcheck, then confirm the second-instance refusal (README §9.3).
+7. **Smoke test** with a synthetic test account: `/bantuan`; `/pengeluaran 25rb makan` → category → ✅; press ✅ again (expect "sudah disimpan sebelumnya"); `/riwayat` → detail → 🗑️ → confirm; `/riwayat dihapus` → ♻️; `/saldo`; `/laporan`; `/kategori` → add and deactivate one; a viewer or editor account in a business workspace when those exist. Check that the logs show no message text, amounts or tokens (README §10).
+8. **Rollback:**
+   - Application problem: `stop bot`, retag the previous image, `up -d bot`. The Step 5 code ignores the new tables.
+   - Schema problem before any real use: README §12.2, restoring the step-1 backup (the downgrade is refused in staging).
+   - After testers have recorded data: prefer a forward-fix revision. A restore loses everything entered since the backup.
+
+### 12.7 Tests
+
+| Area | Tests |
+|---|---|
+| Unit (no database) | `test_money.py` (parsing, half-up, bounds, AT-ENT-20, AT-PARSE-PROP), `test_finance_domain.py` (names, dates and months in the timezone, capture/edit state machines, entry rules), `tests/authz/test_policy_matrix.py` (AT-RBAC-SYNC-01 against `tests/authz/expected_matrix.py`, evaluation order), `test_finance_adapter.py` (callback codec and forgery, AT-RENDER-01, argument parsing), `test_ledger_revision.py` (offline SQL: RLS, grants, triggers, psql safety), `test_finance_services.py` and `test_telegram_finance.py` (services and handlers over an in-memory store) |
+| PostgreSQL | `test_ledger_schema_db.py` (AT-ENT-04…10, 16, 17; AT-ISO-01/03; AT-RLS-00/01/02 for the ledger tables), `test_ledger_service_db.py` (seeding under concurrency, category rules, capture, AT-TXN-IDEMP-01, concurrent conversation starts, AT-ENT-11/12/19, AT-TXN-OCC-01, void/restore, AT-RPT-01 month boundaries, paging, AT-ISO-05, AT-RBAC-P-01, finance AT-RBAC-M rows, AT-RBAC-R9-02, removal mid-conversation, AT-LOG-01), `test_telegram_finance_db.py` (every command, button flows, duplicate ✅, stale/forged/foreign buttons, unknown accounts, `/start`), `test_ledger_migration_db.py` (populated 0003 → 0004 → 0003 → 0004). The Phase 1 RLS coverage, privilege and definer-function inventories include the new objects |
+
+### 12.8 Interpretations and limits (owner review requested)
+
+1. **Active workspace = personal.** There is no `/ruang` yet (FR-WSP-03, `user_preferences`). The services accept an explicit workspace, and the tests exercise business workspaces seeded by the owner role, but the bot always uses the personal workspace.
+2. **Accounts:** only the seeded "Kas" exists, and every income or expense goes to the member's default account. `/akun`, account management, opening balances and transfers by text or `/transfer` (FR-ACC-01…03, FR-TXN-07) are not built. The schema and `domain/ledger.py` already support two-leg transfers, so `/saldo` sums every account.
+3. **Not built:** free-text capture and the local parser (FR-TXN-03, AT-PARSE-GOLDEN), the undo button (FR-TXN-13), type change (D21), revision history view (FR-TXN-12), the 6-month comparison (FR-RPT-03), CSV export, `/audit`, draft-expiry and prune jobs (expiry is enforced lazily on use), and `security.cross_tenant_probe` (R-12; NotFound is not audited).
+4. **Command names:** the documented names (docs/02 §12) plus the Step 6 aliases `/tambah`, `/transaksi`, `/ringkasan` and the shortcuts `/pemasukan`, `/pengeluaran`.
+5. **Open decisions applied with their documented defaults:** D2 (a) Editors edit any transaction, D15 negative balances allowed with ⚠️, D17 no period locking, D21 (a) the type is immutable, D22 (a) signed entries with leg names.

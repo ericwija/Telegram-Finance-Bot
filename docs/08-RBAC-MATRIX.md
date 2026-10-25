@@ -11,7 +11,7 @@
 - **Roles exist only within a workspace**, through `workspace_memberships.role`. There are no global roles that grant tenant data access.
 - `is_platform_admin` grants **platform operations only**: onboarding invites, suspending users, backups, `/status`. It grants **no** permission inside any workspace (§7).
 - The decision is `allow(principal, workspace, permission, resource?)`. It is evaluated **at execution time** with the *current* membership, role and workspace status (G-2).
-- A single code table, `authz/policy.py::ROLE_PERMISSIONS`, implements §3. The tests in doc 07 assert the code table equals the expected matrix encoded in the test suite. Changing either side without the other fails CI.
+- A single code table, `authz/policy.py::ROLE_PERMISSIONS`, implements §3 (Step 6; with `PERSONAL_PERMISSIONS` and the §5 overlay; D2 default (a)). `tests/authz/expected_matrix.py` encodes this table independently (AT-RBAC-SYNC-01). The tests in doc 07 assert the code table equals the expected matrix encoded in the test suite. Changing either side without the other fails CI.
 
 Evaluation order (first failing step decides):
 

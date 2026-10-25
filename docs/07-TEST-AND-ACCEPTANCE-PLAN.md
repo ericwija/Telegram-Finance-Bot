@@ -246,6 +246,7 @@ AT-MIG-* covers the **V1 → V2 data import** (Phase 7). Schema-migration tests 
 |---|---|---|
 | P1 Step 2 | lint/format/type/import-linter, AT-CFG-*, AT-LOG-01 (skeleton), no-import-side-effects test | `uv run pytest` green locally |
 | P1 Steps 3–5 | + AT-RLS-00, AT-RLS-04, AT-RLS-05, AT-RLS-07, AT-RLS-COVERAGE (Phase 1 tables), AT-ENV-*, AT-DEP-01, AT-LOCK-01 | Fresh-VM staging compose bring-up |
+| Step 6 (ledger core, doc 10 §12.7) | AT-ENT-04…12, 16, 17, 19, 20; AT-ISO-01/03/05; AT-RLS-00/01/02/06 + COVERAGE for the ledger tables; AT-RBAC-SYNC-01, finance AT-RBAC-M rows, AT-RBAC-P-01, AT-RBAC-R9-02; AT-TXN-IDEMP-01, AT-TXN-OCC-01; AT-RPT-01; AT-RENDER-01; AT-LOG-01; AT-PARSE-PROP (amounts) | `make check` and `make test-db` |
 | P2 | AT-RBAC-* (all), AT-PWS-*, AT-RLS-*, AT-TOK-* | UAT-01, 03, 05 (members), 06, 07, 08 |
 | P3 | + AT-ISO-*, **AT-ENT-***, AT-PARSE-*, AT-TXN-*, AT-BAL-PROP-01, AT-RENDER-*, AT-TZ-01, AT-STATE-01 | UAT-02 (no AI), 04, 09 |
 | P4 | + AT-AI-*, AT-QUOTA-*, AT-PRIV-RCPT-01, AT-ISO-AI-01 | UAT-02 (with AI), 10; live smoke |

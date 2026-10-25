@@ -10,9 +10,11 @@ Order of processing for every update (handler group -1 runs first):
    notice per window. This happens before any database access.
 
 Then the command handlers run (private chats only): ``/start`` with deep links (FR-IDN-01/02/
-07) and the platform-admin invite commands. The acting user is always the verified Telegram
-sender. ``/start`` payloads are also limited per account (T17, 10 bad payloads/min) before the
-database is touched; the refusal text never depends on whether the account or invite exists.
+07), the platform-admin invite commands and the finance commands, conversation text and buttons
+(``finance.py``; callback queries pass the same gate). The acting user is always the verified
+Telegram sender. ``/start`` payloads are also limited per account (T17, 10 bad payloads/min)
+before the database is touched; the refusal text never depends on whether the account or invite
+exists.
 
 Replies use ``parse_mode=HTML``; the reply builders escape every interpolated value. Telegram
 API failures on a reply (the user blocked the bot, a bad request, flood control) are logged by
@@ -42,6 +44,7 @@ from telegram.request import BaseRequest
 
 from finbot.adapters.telegram import admin_invites
 from finbot.adapters.telegram import messages_id as msg
+from finbot.adapters.telegram.finance import FinanceServices, register_finance_handlers
 from finbot.adapters.telegram.ratelimit import (
     BAD_STARTS_PER_MINUTE,
     UPDATES_PER_MINUTE,
@@ -55,7 +58,7 @@ from finbot.services.platform_invites import PlatformInviteService
 logger = logging.getLogger(__name__)
 
 #: Update types the bot asks Telegram for; everything else is never delivered.
-ALLOWED_UPDATES = (Update.MESSAGE, Update.MY_CHAT_MEMBER)
+ALLOWED_UPDATES = (Update.MESSAGE, Update.CALLBACK_QUERY, Update.MY_CHAT_MEMBER)
 #: Bounded so that concurrent handlers stay well under finbot_app's CONNECTION LIMIT 20.
 MAX_CONCURRENT_UPDATES = 8
 _BAD_START = frozenset({StartOutcome.NEEDS_INVITE, StartOutcome.INVITE_REFUSED})
@@ -67,6 +70,7 @@ class BotServices:
     onboarding: OnboardingService
     invites: PlatformInviteService
     timezone: str = "Asia/Jakarta"  # for listing invite expiry (G-7 default)
+    finance: FinanceServices | None = None  # Step 6: the finance commands and buttons
 
 
 @dataclass(slots=True)
@@ -227,6 +231,8 @@ def register_handlers(
     application.add_handler(
         CommandHandler(admin_invites.REVOKE_COMMAND, handlers.invite_revoke, filters=private)
     )
+    if services.finance is not None:
+        register_finance_handlers(application, services.finance)
     application.add_error_handler(handlers.error)
 
 

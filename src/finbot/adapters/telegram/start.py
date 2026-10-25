@@ -39,9 +39,14 @@ def start_payload(text: str) -> str | None:
 def render(result: StartResult) -> str:
     match result.outcome:
         case StartOutcome.ONBOARDED:
-            return msg.START_ONBOARDED.format(workspace=_workspace_name(result))
+            return (
+                msg.START_ONBOARDED.format(workspace=_workspace_name(result)) + msg.START_MENU_HINT
+            )
         case StartOutcome.WELCOME_BACK:
-            return msg.START_WELCOME_BACK.format(workspace=_workspace_name(result))
+            return (
+                msg.START_WELCOME_BACK.format(workspace=_workspace_name(result))
+                + msg.START_MENU_HINT
+            )
         case StartOutcome.NEEDS_INVITE:
             return msg.START_NEEDS_INVITE
         case StartOutcome.INVITE_REFUSED:

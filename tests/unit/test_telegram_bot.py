@@ -369,7 +369,10 @@ def test_dry_run_builds_offline(monkeypatch: pytest.MonkeyPatch) -> None:
     assert main(["bot", "--dry-run"], out=out, err=io.StringIO()) == 0
     text = out.getvalue()
     assert "no Telegram or database connection" in text
-    assert "/start, /undangan_baru, /undangan_cabut, /undangan_daftar" in text
+    assert "/start, /tambah, /transaksi, /undangan_baru, /undangan_cabut, /undangan_daftar" in text
+    for command in ("/catat", "/pemasukan", "/pengeluaran", "/riwayat", "/saldo", "/laporan"):
+        assert command in text
+    assert "callback_query" in text
 
 
 @pytest.mark.asyncio

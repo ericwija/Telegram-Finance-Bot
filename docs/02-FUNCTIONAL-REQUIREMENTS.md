@@ -174,19 +174,24 @@
 |---|---|---|
 | `/start` | Menu, onboarding and invitation deep links | `/start` |
 | `/bantuan` (`/help`) | Help | `/help` |
+| `/batal` | Cancel the conversation in progress (Step 6) | — |
 | `/ruang` | List and switch workspaces; `/ruang baru` creates a business | — |
-| `/catat` | Guided entry | `/catat` |
+| `/catat` (`/tambah`) | Guided entry (Step 6). `/pemasukan` and `/pengeluaran [jumlah] [keterangan]` start it with the type (and amount) given | `/catat` |
 | `/transfer` | Guided transfer | — |
-| `/saldo` | Account balances | — |
-| `/laporan` | Cash-flow report | `/laporan` |
-| `/riwayat` | History; edit, delete and restore | `/hapus` (replaced) |
-| `/akun`, `/kategori` | Manage accounts and categories | — |
+| `/saldo` | Account balances (Step 6: recorded balances, plus all-time income, expense and net) | — |
+| `/laporan` (`/ringkasan`) | Cash-flow report (Step 6: one calendar month, `/laporan [bulan]`) | `/laporan` |
+| `/riwayat` (`/transaksi`) | History; edit, delete and restore (Step 6: `[pemasukan\|pengeluaran] [dihapus] [bulan \| tanggal tanggal]`) | `/hapus` (replaced) |
+| `/akun`, `/kategori` | Manage accounts and categories (Step 6: `/kategori` only) | — |
 | `/anggota`, `/undang` | Members and invitations | — |
 | `/ekspor` | CSV export | `/sheet` (replaced) |
 | `/audit` | Audit view | — |
 | `/profil` | Profile and default account | `/me` |
 | `/status` | Platform admin health | — |
 | `/undangan_baru`, `/undangan_daftar`, `/undangan_cabut` | Platform admin: create, list and revoke onboarding invites (FR-IDN-01; private chat only; doc 04 §5.8) | — |
+
+**Step 6 status (finance core, doc 10 §12).**
+- *Implemented:* FR-IDN-04 (lazily, on first use), FR-CAT-01…04, FR-TXN-01/02/02a (income and expense, through the D1 entry model), FR-TXN-04…06, FR-TXN-08, FR-TXN-09, FR-TXN-10 (without type change), FR-TXN-11, FR-ACC-04/05/06 (seeded "Kas" only), FR-RPT-01 (monthly), FR-RPT-02 (as of today) and FR-RPT-05.
+- *Not built yet:* FR-ACC-01…03, FR-TXN-03, FR-TXN-07, FR-TXN-12/13, FR-RPT-03/04 and FR-IDN-07's full menu (`/start` points to `/bantuan`).
 
 ## 13. Open items specific to this document
 

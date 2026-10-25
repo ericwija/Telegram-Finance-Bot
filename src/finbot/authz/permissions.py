@@ -1,0 +1,32 @@
+"""Workspace-scoped permissions (docs/08 §3.1, rows 1 to 26)."""
+
+from enum import StrEnum
+
+
+class Permission(StrEnum):
+    WORKSPACE_VIEW = "workspace.view"
+    WORKSPACE_UPDATE = "workspace.update"
+    WORKSPACE_DELETE = "workspace.delete"
+    WORKSPACE_CANCEL_DELETION = "workspace.cancel_deletion"
+    WORKSPACE_TRANSFER_OWNERSHIP = "workspace.transfer_ownership"
+    MEMBER_VIEW = "member.view"
+    MEMBER_INVITE = "member.invite"
+    MEMBER_REVOKE_INVITATION = "member.revoke_invitation"
+    MEMBER_CHANGE_ROLE = "member.change_role"
+    MEMBER_REMOVE = "member.remove"
+    MEMBER_LEAVE = "member.leave"
+    ACCOUNT_VIEW = "account.view"
+    ACCOUNT_MANAGE = "account.manage"
+    CATEGORY_VIEW = "category.view"
+    CATEGORY_MANAGE = "category.manage"
+    TRANSACTION_VIEW = "transaction.view"
+    TRANSACTION_VIEW_DELETED = "transaction.view_deleted"
+    TRANSACTION_CREATE = "transaction.create"
+    TRANSACTION_UPDATE = "transaction.update"
+    TRANSACTION_DELETE = "transaction.delete"
+    TRANSACTION_RESTORE = "transaction.restore"
+    RECEIPT_SCAN = "receipt.scan"
+    REPORT_VIEW = "report.view"
+    REPORT_EXPORT = "report.export"
+    AUDIT_VIEW = "audit.view"
+    PREFERENCE_DEFAULT_ACCOUNT = "preference.default_account"

@@ -19,7 +19,8 @@ BOOTSTRAP = "bootstrap_platform_admin(bigint, text)"
 def sql_0003(monkeypatch: pytest.MonkeyPatch) -> str:
     monkeypatch.setenv("FINBOT_ENV", "staging")
     out, err = io.StringIO(), io.StringIO()
-    assert migrate.main(["sql", "upgrade", "head"], out=out, err=err) == 0, err.getvalue()
+    # Pinned to 0003: later revisions add their own grants (0004: ledger tables).
+    assert migrate.main(["sql", "upgrade", "0003"], out=out, err=err) == 0, err.getvalue()
     sql = out.getvalue()
     return sql[sql.index(f"CREATE FUNCTION public.{BOOTSTRAP.split('(', maxsplit=1)[0]}(") :]
 

@@ -15,7 +15,18 @@ from tests.support.phase1 import World, as_app, rows, scalar, seed
 
 pytestmark = [pytest.mark.db, pytest.mark.asyncio]
 
-RLS_TABLES = ("users", "workspaces", "workspace_memberships", "audit_events")
+# Revision 0004 (ledger core) adds tenant tables; the coverage and privilege checks below
+# include them, so a table added without RLS, FORCE or a policy fails here.
+LEDGER_TABLES = (
+    "accounts",
+    "categories",
+    "transactions",
+    "transaction_entries",
+    "transaction_revisions",
+    "drafts",
+    "pending_actions",
+)
+RLS_TABLES = ("users", "workspaces", "workspace_memberships", "audit_events", *LEDGER_TABLES)
 NON_RLS_TABLES = {"alembic_version", "platform_meta"}  # no tenant data; app access is SELECT-only
 # Revision 0002 (head): RLS + FORCE + a deny-all policy, no app grants (docs/09 §4.3).
 IDENTITY_TABLES = ("telegram_identities", "onboarding_invites")
@@ -510,6 +521,11 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "create_onboarding_invite",
         "list_onboarding_invites",
         "revoke_onboarding_invite",
+        # 0004 ledger trigger functions: definer so they see every row of one transaction or
+        # one referenced row whatever the caller's RLS context; executable by nobody directly.
+        "ledger_entries_balanced",
+        "ledger_entry_active_account",
+        "ledger_txn_active_category",
     }
     for f in functions:
         assert f.owner == "finbot_owner"
@@ -526,6 +542,9 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "create_onboarding_invite": {"finbot_app"},
         "list_onboarding_invites": {"finbot_app"},
         "revoke_onboarding_invite": {"finbot_app"},
+        "ledger_entries_balanced": set(),
+        "ledger_entry_active_account": set(),
+        "ledger_txn_active_category": set(),
     }
 
 

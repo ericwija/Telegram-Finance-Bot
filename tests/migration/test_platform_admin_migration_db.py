@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 from alembic import command
 from alembic.config import Config
+from alembic.script import ScriptDirectory
 
 from finbot.adapters.cli import migrate
 from tests.migration.test_baseline_migration_db import _query, _state, _with_downgrade
@@ -73,7 +74,8 @@ def test_upgrade_does_not_bootstrap_anything(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
     command.upgrade(alembic_config, "head")
-    assert _state(pg_cluster, test_database)["version"] == ["0003"]
+    head = ScriptDirectory.from_config(alembic_config).get_current_head()
+    assert _state(pg_cluster, test_database)["version"] == [head]
     assert _query(pg_cluster, test_database, "SELECT count(*) FROM users")[0][0] == 0
     keys = _query(pg_cluster, test_database, "SELECT key FROM platform_meta")
     assert [k[0] for k in keys] == ["environment"]

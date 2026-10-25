@@ -143,3 +143,58 @@ async def eventually(condition: Callable[[], bool]) -> None:
     async with asyncio.timeout(10):
         while not condition():  # noqa: ASYNC110 - polls fakes and pg_locks, which have no event
             await asyncio.sleep(0.01)
+
+
+def callback_update(
+    app: Application[Any, Any, Any, Any, Any, Any],
+    user_id: int,
+    data: str,
+    *,
+    message_id: int = 1,
+    update_id: int | None = None,
+) -> Update:
+    """A button press on a bot message in the private chat with ``user_id``."""
+    payload = {
+        "update_id": next(_ids) if update_id is None else update_id,
+        "callback_query": {
+            "id": str(next(_ids)),
+            "from": {"id": user_id, "is_bot": False, "first_name": "Budi"},
+            "chat_instance": "test",
+            "data": data,
+            "message": {
+                "message_id": message_id,
+                "date": 1_760_000_000,
+                "chat": {"id": user_id, "type": "private"},
+                "from": _BOT_USER,
+                "text": "…",
+            },
+        },
+    }
+    update = Update.de_json(payload, app.bot)
+    assert update is not None
+    return update
+
+
+Buttons = list[tuple[str, str]]
+
+
+def shown(api: FakeBotApi, chat_id: int) -> list[tuple[str, Buttons]]:
+    """Every message sent or edited in the chat, in order, as (text, [(label, data)])."""
+    result = []
+    for endpoint, params in api.calls:
+        if endpoint not in ("sendMessage", "editMessageText") or params.get("chat_id") != chat_id:
+            continue
+        markup = params.get("reply_markup") or {}
+        if isinstance(markup, str):
+            markup = json.loads(markup)
+        buttons = [
+            (b["text"], b["callback_data"])
+            for row in markup.get("inline_keyboard", [])
+            for b in row
+        ]
+        result.append((params["text"], buttons))
+    return result
+
+
+def answers(api: FakeBotApi) -> list[str | None]:
+    return [p.get("text") for endpoint, p in api.calls if endpoint == "answerCallbackQuery"]
