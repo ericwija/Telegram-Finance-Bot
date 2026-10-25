@@ -5,6 +5,11 @@
 # - Third-party code is pinned: actions by commit SHA, uv by version + SHA-256, PostgreSQL by the
 #   image digest in deploy/staging/compose.yml (the same image staging runs).
 # - Database tests fail the job if any of them is skipped (FINBOT_REQUIRE_DB_TESTS=1).
+# - Security gates (NFR-SEC-04, NFR-SEC-06, docs/09 §9; docs/10 §13.6): gitleaks over the whole
+#   history, pip-audit over the locked dependency set, Trivy over the lockfile, the Dockerfile and
+#   the built V2 image. Any finding fails the job (Trivy: High or Critical). The scanners are
+#   pinned binaries (version + SHA-256 from the vendor's release checksums) or a pinned PyPI
+#   version; they need no secrets and no external service beyond their public databases.
 # V1 (main.py, requirements.txt) is not built or tested here.
 
 name: ci
@@ -22,6 +27,11 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  GITLEAKS_VERSION: "8.30.1"
+  GITLEAKS_SHA256: "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb"
+  TRIVY_VERSION: "0.75.0"
+  TRIVY_SHA256: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+  PIP_AUDIT_VERSION: "2.10.1"
   UV_VERSION: "0.12.23"
   UV_SHA256: "9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6"
   UV_PYTHON_PREFERENCE: only-managed
@@ -92,3 +102,48 @@ jobs:
           docker pull "$image"
       - name: Database tests (fail if any is skipped)
         run: make test-db
+
+  security:
+    name: security gates (gitleaks, pip-audit, Trivy)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0 # gitleaks scans every commit, not just the tip
+      - name: Install uv, gitleaks and Trivy (checksum-verified)
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/uv.tar.gz \
+            "https://github.com/astral-sh/uv/releases/download/${UV_VERSION}/uv-x86_64-unknown-linux-gnu.tar.gz"
+          curl -fsSL -o /tmp/gitleaks.tar.gz \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSL -o /tmp/trivy.tar.gz \
+            "https://github.com/aquasecurity/trivy/releases/download/v${TRIVY_VERSION}/trivy_${TRIVY_VERSION}_Linux-64bit.tar.gz"
+          printf '%s  %s\n' "${UV_SHA256}" /tmp/uv.tar.gz "${GITLEAKS_SHA256}" /tmp/gitleaks.tar.gz \
+            "${TRIVY_SHA256}" /tmp/trivy.tar.gz | sha256sum --check --strict
+          install -d "$HOME/.local/bin"
+          tar -xzf /tmp/uv.tar.gz -C /tmp
+          install -m 0755 /tmp/uv-x86_64-unknown-linux-gnu/uv /tmp/uv-x86_64-unknown-linux-gnu/uvx "$HOME/.local/bin/"
+          tar -xzf /tmp/gitleaks.tar.gz -C "$HOME/.local/bin" gitleaks
+          tar -xzf /tmp/trivy.tar.gz -C "$HOME/.local/bin" trivy
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Secret detection (gitleaks, whole history, values redacted)
+        run: gitleaks git --redact --no-banner --exit-code 1 .
+      - name: Python dependency audit (pip-audit over uv.lock, hashes required)
+        run: |
+          set -euo pipefail
+          uv export --frozen --all-groups --no-emit-project --format requirements-txt -o /tmp/requirements.txt
+          uvx --from "pip-audit==${PIP_AUDIT_VERSION}" pip-audit --strict --disable-pip \
+            --require-hashes -r /tmp/requirements.txt --progress-spinner off
+      - name: Lockfile and Dockerfile scan (Trivy, High/Critical fail)
+        run: |
+          trivy fs --scanners vuln,secret,misconfig --severity HIGH,CRITICAL --exit-code 1 \
+            --skip-files main.py,requirements.txt,Dockerfile,docker-compose.yml .
+      - name: Build the V2 image (pinned base digest; nothing is pushed)
+        run: docker build -f deploy/docker/Dockerfile -t finbot-v2:ci .
+      - name: Image scan (Trivy, High/Critical fail; NFR-SEC-06)
+        # Strict as approved: unfixed base-image CVEs fail too. Exceptions need an owner-approved
+        # .trivyignore entry with a reason and an expiry (docs/10 §13.6).
+        run: trivy image --scanners vuln,secret --severity HIGH,CRITICAL --exit-code 1 finbot-v2:ci
