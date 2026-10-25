@@ -13,7 +13,13 @@ from datetime import date
 from typing import Final
 from uuid import UUID
 
-from finbot.domain.finance import EditField, HistoryFilter, InvalidInputError
+from finbot.domain.finance import (
+    CATEGORY_MAX_PAGES,
+    DraftField,
+    EditField,
+    HistoryFilter,
+    InvalidInputError,
+)
 from finbot.domain.ledger import TxnType
 
 PREFIX: Final = "f"
@@ -28,10 +34,19 @@ _FIELD_CODE: Final = {
     EditField.DATE: "t",
 }
 _CODE_FIELD: Final = {v: k for k, v in _FIELD_CODE.items()}
+_DRAFT_FIELD_CODE: Final = {
+    DraftField.TYPE: "y",
+    DraftField.AMOUNT: "a",
+    DraftField.CATEGORY: "c",
+    DraftField.DESCRIPTION: "d",
+    DraftField.DATE: "t",
+}
+_CODE_DRAFT_FIELD: Final = {v: k for k, v in _DRAFT_FIELD_CODE.items()}
 _REF_RE = re.compile(r"[0-9a-f]{8}")
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
 _DATE_RE = re.compile(r"\d{8}")
 _MAX_VERSION: Final = 1_000_000
+_MAX_CATEGORY_PAGE: Final = CATEGORY_MAX_PAGES - 1
 
 
 class InvalidCallbackError(ValueError):
@@ -46,6 +61,7 @@ class Callback:
     entity_id: UUID | None = None
     version: int | None = None
     field: EditField | None = None
+    draft_field: DraftField | None = None
     page: int = 0
     history: HistoryFilter | None = None
     flag: bool = False
@@ -73,8 +89,21 @@ def draft_skip(ref: str) -> str:
     return _join("sk", ref)
 
 
-def draft_date(ref: str) -> str:
-    return _join("dt", ref)
+def draft_category_page(ref: str, page: int) -> str:
+    return _join("cp", ref, str(page))
+
+
+def draft_review(ref: str) -> str:
+    """✏️ Ubah on a confirmation: choose the field to correct."""
+    return _join("ub", ref)
+
+
+def draft_revise(ref: str, draft_field: DraftField) -> str:
+    return _join("uf", ref, _DRAFT_FIELD_CODE[draft_field])
+
+
+def draft_back(ref: str) -> str:
+    return _join("rv", ref)
 
 
 def draft_confirm(ref: str) -> str:
@@ -82,6 +111,7 @@ def draft_confirm(ref: str) -> str:
 
 
 def draft_cancel(ref: str) -> str:
+    """❌ of one conversation (a draft or a category prompt): cancels only that one."""
     return _join("no", ref)
 
 
@@ -127,8 +157,10 @@ def restore(transaction_id: UUID, version: int) -> str:
     return _join("rs", str(transaction_id), str(version))
 
 
-def category_list(txn_type: TxnType | None) -> str:
-    return _join("kl", _TYPE_CODE[txn_type] if txn_type else "a")
+def category_list(txn_type: TxnType | None, page: int = 0, *, archived: bool = False) -> str:
+    return _join(
+        "kl", _TYPE_CODE[txn_type] if txn_type else "a", str(page), "1" if archived else "0"
+    )
 
 
 def category_detail(category_id: UUID) -> str:
@@ -192,8 +224,9 @@ def _date(value: str) -> date | None:
 
 
 _ARITY: Final = {
-    "ty": 2, "ca": 2, "sk": 1, "dt": 1, "ok": 1, "no": 1, "h": 5, "kh": 2, "tx": 1, "ed": 2,
-    "ef": 3, "dl": 2, "dy": 2, "rs": 2, "kl": 1, "kd": 1, "kn": 1, "kr": 1, "ka": 2,
+    "ty": 2, "ca": 2, "cp": 2, "sk": 1, "ub": 1, "uf": 2, "rv": 1, "ok": 1, "no": 1, "h": 5,
+    "kh": 2, "tx": 1, "ed": 2, "ef": 3, "dl": 2, "dy": 2, "rs": 2, "kl": 3, "kd": 1, "kn": 1,
+    "kr": 1, "ka": 2,
 }  # fmt: skip
 
 
@@ -211,8 +244,14 @@ def parse(data: str | None) -> Callback:  # noqa: PLR0911, PLR0912 - one branch 
                 return Callback(action, ref=_ref(args[0]), txn_type=_txn_type(args[1]))
             case "ca":
                 return Callback(action, ref=_ref(args[0]), entity_id=_uuid(args[1]))
-            case "sk" | "dt" | "ok" | "no":
+            case "cp":
+                return Callback(action, ref=_ref(args[0]), page=_int(args[1], _MAX_CATEGORY_PAGE))
+            case "sk" | "ub" | "rv" | "ok" | "no":
                 return Callback(action, ref=_ref(args[0]))
+            case "uf":
+                if args[1] not in _CODE_DRAFT_FIELD:
+                    raise InvalidCallbackError("field")
+                return Callback(action, ref=_ref(args[0]), draft_field=_CODE_DRAFT_FIELD[args[1]])
             case "h":
                 type_code = args[1]
                 txn_type = None if type_code == "a" else _txn_type(type_code)
@@ -247,7 +286,12 @@ def parse(data: str | None) -> Callback:  # noqa: PLR0911, PLR0912 - one branch 
                     version=_int(args[2], _MAX_VERSION),
                 )
             case "kl":
-                return Callback(action, txn_type=None if args[0] == "a" else _txn_type(args[0]))
+                return Callback(
+                    action,
+                    txn_type=None if args[0] == "a" else _txn_type(args[0]),
+                    page=_int(args[1], _MAX_CATEGORY_PAGE),
+                    flag=_flag(args[2]),
+                )
             case "kn":
                 return Callback(action, txn_type=_txn_type(args[0]))
             case "ka":

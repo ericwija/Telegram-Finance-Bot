@@ -9,7 +9,9 @@ A real run (Step 5, staging only, operated by ``deploy``) long-polls Telegram. I
 (:func:`serve`) is strictly ordered, and polling starts only after every guard passed:
 
 1. G-ENV-2: the live connection's ``current_database()`` equals ``FINBOT_DB_NAME``; then
-   G-ENV-3: the database environment marker equals ``FINBOT_ENV``.
+   G-ENV-3: the database environment marker equals ``FINBOT_ENV``; then G-ENV-7: the schema
+   revision (``alembic_version``) is one this release supports. The bot never migrates: on a
+   database that is behind (e.g. ``0003``) it refuses to start and the operator migrates.
 2. G-ENV-6: the single-poller advisory lock is taken on a dedicated connection
    (:mod:`finbot.infra.db.poller_lock`). If another process holds it, the bot exits with
    "poller lock held" (AC-P1-04) without ever contacting Telegram.

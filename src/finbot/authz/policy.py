@@ -116,9 +116,15 @@ PERSONAL_PERMISSIONS: Final = frozenset(
     }
 )
 
-#: docs/08 §5: what remains allowed while a business workspace is pending deletion.
+#: docs/08 §5: what remains allowed while a workspace is pending deletion: every ``*.view``
+#: permission (``audit.view`` and ``transaction.view_deleted`` included) and ``member.leave``.
+#: The role must still hold the permission (step 6). Setting a default account is a write.
 _READ_ONLY_ALLOWED: Final = frozenset(
-    {*_VIEW - {P.PREFERENCE_DEFAULT_ACCOUNT}, P.TRANSACTION_VIEW_DELETED, P.MEMBER_LEAVE}
+    {
+        *(p for p in Permission if p.value.endswith(".view")),
+        P.TRANSACTION_VIEW_DELETED,
+        P.MEMBER_LEAVE,
+    }
 )
 _READ_ONLY_OWNER_EXTRA: Final = frozenset({P.WORKSPACE_CANCEL_DELETION, P.REPORT_EXPORT})
 

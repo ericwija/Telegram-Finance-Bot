@@ -18,6 +18,7 @@ from finbot.domain.finance import (
     DEFAULT_CATEGORIES,
     ConflictError,
     DraftExpiredError,
+    DraftField,
     DuplicateNameError,
     EditField,
     HistoryFilter,
@@ -169,7 +170,7 @@ async def test_capture_flow_writes_header_entry_revision_and_audit(
     makanan = next(c for c in view.categories if c.name == "Makanan")
     view = await f.capture.choose_category(actor, view.ref, makanan.id)
     view = await f.capture.input_text(actor, "Makan siang ZZSECRETZZ")  # type: ignore[assignment]
-    view = await f.capture.ask_date(actor, view.ref)
+    view = await f.capture.revise(actor, view.ref, DraftField.DATE)
     view = await f.capture.input_text(actor, "kemarin")  # type: ignore[assignment]
     result = await f.capture.confirm(actor, view.ref)
     txn = result.record

@@ -19,7 +19,12 @@ Accepted input (case-insensitive, surrounding whitespace ignored):
   groups of exactly three digits and no unit) is twenty-five thousand, and a single ``.``
   before a unit is a fraction (``1.5jt``);
 * an optional unit: ``rb``/``ribu``/``k`` (times 1,000), ``jt``/``juta`` (times 1,000,000) and
-  ``miliar``/``milyar`` (times 1,000,000,000).
+  ``miliar``/``milyar`` (times 1,000,000,000), attached (``25rb``) or after a space
+  (``2 juta``).
+
+:func:`split_leading_amount` finds the amount at the start of a command argument with the same
+grammar, so ``/pengeluaran 2 juta sewa`` is two million with the description ``sewa``, never two
+rupiah with the description ``juta sewa``.
 """
 
 import re
@@ -33,6 +38,7 @@ MIN_AMOUNT: Final = 1
 MAX_AMOUNT: Final = 1_000_000_000_000
 CURRENCY: Final = "IDR"  # the only currency in the MVP (workspaces.currency CHECK)
 
+_UNIT_WORDS: Final = "rb|ribu|k|jt|juta|miliar|milyar"
 _UNITS: Final = {
     "rb": 1_000,
     "ribu": 1_000,
@@ -42,9 +48,13 @@ _UNITS: Final = {
     "miliar": 1_000_000_000,
     "milyar": 1_000_000_000,
 }
-_AMOUNT_RE = re.compile(
-    r"^(?:rp\.?\s*)?(?P<number>\d[\d.,]*)\s*(?P<unit>rb|ribu|k|jt|juta|miliar|milyar)?$"
+_AMOUNT_RE = re.compile(rf"^(?:rp\.?\s*)?(?P<number>\d[\d.,]*)\s*(?P<unit>{_UNIT_WORDS})?$")
+#: The same grammar at the start of a longer text; a unit must end at a word boundary.
+_LEADING_AMOUNT_RE = re.compile(
+    rf"^(?:rp\.?\s*)?\d[\d.,]*(?:\s*(?:{_UNIT_WORDS})(?!\w))?(?=\s|$)", re.IGNORECASE
 )
+#: A word right after a unit-less number that looks like a misspelt unit (``2 jutaan``).
+_UNIT_LIKE_RE = re.compile(r"^(?:rb|ribu|jt|juta|miliar|milyar)", re.IGNORECASE)
 _THOUSANDS_DOT = re.compile(r"^\d{1,3}(?:\.\d{3})+$")
 _THOUSANDS_COMMA = re.compile(r"^\d{1,3}(?:,\d{3})+$")
 _MAX_INPUT = 40
@@ -130,6 +140,33 @@ def parse_amount(text: str) -> ParsedAmount:
     if remainder * 2 >= denominator and remainder:
         quotient += 1  # half-up
     return ParsedAmount(validate_amount(quotient), rounded=remainder != 0)
+
+
+def split_leading_amount(text: str) -> tuple[str | None, str | None]:
+    """(amount text, rest) of a command argument such as ``Rp 2 juta makan siang``.
+
+    The amount is the longest prefix that the :func:`parse_amount` grammar accepts, separated
+    units included. Without such a prefix the first word is returned as the amount, so that
+    parsing it reports the error instead of the text silently becoming a description. A
+    unit-less number followed by a unit-like word (``2 jutaan``) is returned whole, which
+    :func:`parse_amount` then refuses: the bot asks again rather than guessing.
+    """
+    raw = " ".join(text.split())
+    if not raw:
+        return None, None
+    match = _LEADING_AMOUNT_RE.match(raw)
+    if match is None:
+        first, _, rest = raw.partition(" ")
+        if first.lower().rstrip(".") == "rp" and rest:  # "Rp abc": keep the prefix with it
+            second, _, rest = rest.partition(" ")
+            first = f"{first} {second}"
+        return first, rest or None
+    amount, rest = match.group(0), raw[match.end() :].strip()
+    has_unit = re.search(rf"(?:{_UNIT_WORDS})$", amount, re.IGNORECASE) is not None
+    if rest and not has_unit and _UNIT_LIKE_RE.match(rest):
+        word, _, rest = rest.partition(" ")
+        return f"{amount} {word}", rest or None
+    return amount, rest or None
 
 
 def format_rupiah(value: int) -> str:

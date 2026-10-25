@@ -14,6 +14,7 @@ from typing import Any
 
 from sqlalchemy import text
 
+from finbot.domain.finance import DraftField
 from finbot.infra.db.finance import PgFinanceStore
 from finbot.services.capture import CaptureService
 from finbot.services.finance import Actor
@@ -169,6 +170,6 @@ async def record(
     else:
         view = await f.capture.input_text(actor, description)  # type: ignore[assignment]
     if date_text is not None:
-        view = await f.capture.ask_date(actor, view.ref)
+        view = await f.capture.revise(actor, view.ref, DraftField.DATE)
         view = await f.capture.input_text(actor, date_text)  # type: ignore[assignment]
     return await f.capture.confirm(actor, view.ref)

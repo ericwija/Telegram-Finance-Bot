@@ -23,7 +23,7 @@ from finbot.services.ledger import LedgerService
 from finbot.services.onboarding import OnboardingService
 from finbot.services.platform_invites import PlatformInviteService
 from finbot.services.principals import PrincipalService
-from tests.support.finance import Clock, Person, owner_scalar, person
+from tests.support.finance import Clock, Person, owner_rows, owner_scalar, person
 from tests.support.telegram import (
     BOT_TOKEN,
     Buttons,
@@ -131,7 +131,8 @@ async def test_change_date_before_saving(bot: Bot, owner_engine: Any) -> None:
     budi = await person(owner_engine)
     _, buttons = await bot.send(budi, "/catat pengeluaran 10rb parkir")
     _, buttons = await bot.press(budi, button(buttons, "Transportasi"))
-    text, buttons = await bot.press(budi, button(buttons, msg.BUTTON_DATE))
+    _, menu = await bot.press(budi, button(buttons, msg.BUTTON_EDIT))  # ✏️ Ubah (FR-TXN-05)
+    text, buttons = await bot.press(budi, button(menu, msg.EDIT_FIELD_LABEL["date"]))
     assert msg.ASK_DATE in text
     text, _ = await bot.send(budi, "besok")
     assert text == msg.INVALID["date_invalid"]
@@ -266,3 +267,65 @@ async def test_forged_stale_and_foreign_buttons(bot: Bot, owner_engine: Any) -> 
     assert answers(bot.api)[-1] == msg.STALE_BUTTON
     assert len(shown(bot.api, budi.telegram_id)) == before
     assert await _transactions(owner_engine) == 1
+
+
+# ------------------------------------------------------------------- Step 6B regressions
+
+
+async def test_F04_F10_separated_units_correction_and_replay_end_to_end(
+    bot: Bot, owner_engine: Any
+) -> None:
+    budi = await person(owner_engine)
+    _, buttons = await bot.send(budi, "/pengeluaran Rp 2 juta sewa kos")
+    text, buttons = await bot.press(budi, button(buttons, "Tagihan"))
+    assert "<b>Rp 2.000.000</b>" in text
+    assert "Keterangan: sewa kos" in text
+    assert f"{msg.FIELD_ACCOUNT}: Kas" in text
+    _, menu = await bot.press(budi, button(buttons, msg.BUTTON_EDIT))
+    _, buttons = await bot.press(budi, button(menu, msg.EDIT_FIELD_LABEL["amount"]))
+    text, buttons = await bot.send(budi, "1,5 juta")
+    assert "<b>Rp 1.500.000</b>" in text
+    save = button(buttons, msg.BUTTON_SAVE)
+    await bot.press(budi, save)
+    text, _ = await bot.press(budi, save)
+    assert text.startswith("Transaksi ini sudah disimpan sebelumnya")
+    rows = await owner_rows(owner_engine, "SELECT amount, description FROM transactions")
+    assert [(r.amount, r.description) for r in rows] == [(1_500_000, "sewa kos")]
+
+
+async def test_F08_stale_cancel_end_to_end(bot: Bot, owner_engine: Any) -> None:
+    budi = await person(owner_engine)
+    _, old = await bot.send(budi, "/pengeluaran 5rb")
+    _, listing = await bot.send(budi, "/kategori")
+    await bot.press(budi, button(listing, msg.BUTTON_NEW_EXPENSE_CATEGORY))
+    text, _ = await bot.press(budi, button(old, msg.BUTTON_CANCEL))
+    assert text == msg.DRAFT_EXPIRED
+    text, _ = await bot.send(budi, "Kopi & <Teh>")
+    assert "Kopi &amp; &lt;Teh&gt;" in text
+    assert (
+        await owner_scalar(
+            owner_engine, "SELECT count(*) FROM categories WHERE name = 'Kopi & <Teh>'"
+        )
+        == 1
+    )
+
+
+async def test_F07_deactivate_and_reactivate_end_to_end(bot: Bot, owner_engine: Any) -> None:
+    budi = await person(owner_engine)
+    _, buttons = await bot.send(budi, "/kategori pengeluaran")
+    _, detail = await bot.press(budi, button(buttons, "Hiburan"))
+    await bot.press(budi, button(detail, msg.BUTTON_DEACTIVATE))
+    _, buttons = await bot.send(budi, "/kategori nonaktif")
+    _, detail = await bot.press(budi, button(buttons, "Hiburan"))
+    text, _ = await bot.press(budi, button(detail, msg.BUTTON_ACTIVATE))
+    assert "diaktifkan kembali" in text
+    assert await owner_scalar(
+        owner_engine, "SELECT archived_at IS NULL FROM categories WHERE name = 'Hiburan'"
+    )
+    actions = await owner_rows(
+        owner_engine,
+        "SELECT action FROM audit_events WHERE entity_type = 'category' AND action LIKE "
+        "'category.%archived' ORDER BY occurred_at, id",
+    )
+    assert [a.action for a in actions] == ["category.archived", "category.unarchived"]
+    assert bot.api.rejected == []

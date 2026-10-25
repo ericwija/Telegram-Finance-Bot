@@ -34,3 +34,24 @@ EXPECTED_MATRIX: dict[str, str] = {
     "preference.default_account": "YYYYY",
 }
 COLUMNS = ("owner", "admin", "editor", "viewer", "personal")
+
+#: docs/08 §5, transcribed independently: what a role may still do while its workspace is
+#: ``pending_deletion`` (the role must also hold the permission in EXPECTED_MATRIX). Every
+#: ``*.view`` permission (``audit.view`` included), ``transaction.view_deleted`` and
+#: ``member.leave``; the Owner additionally ``workspace.cancel_deletion`` and ``report.export``.
+PENDING_DELETION_ALLOWED: frozenset[str] = frozenset(
+    {
+        "workspace.view",
+        "member.view",
+        "account.view",
+        "category.view",
+        "transaction.view",
+        "transaction.view_deleted",
+        "report.view",
+        "audit.view",
+        "member.leave",
+    }
+)
+PENDING_DELETION_OWNER_EXTRA: frozenset[str] = frozenset(
+    {"workspace.cancel_deletion", "report.export"}
+)

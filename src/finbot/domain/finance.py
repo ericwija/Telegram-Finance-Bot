@@ -11,7 +11,10 @@ Rules implemented here (docs/02 §5, §6, §8; docs/05 §5):
 * **Dates** are business dates in the workspace timezone (G-7). A transaction date lies between
   2000-01-01 and today; back-dating is allowed (D17: no period locking), future dates are not.
 * **Capture** (FR-TXN-04..06, FR-TXN-08): a draft walks type → amount → category →
-  description → confirm, and the date can be changed before confirming. Nothing is a
+  description → confirm. The account is resolved when the draft starts (the member's default
+  account, FR-ACC-05) and stored in the draft, so a later change of the default cannot
+  redirect it. Before confirming, any field (type, amount, category, description, date) can be
+  corrected; every correction returns to the complete confirmation (FR-TXN-05). Nothing is a
   transaction until it is confirmed.
 """
 
@@ -36,7 +39,8 @@ DRAFT_TTL: Final = timedelta(hours=24)  # FR-TXN-06
 PENDING_ACTION_TTL: Final = timedelta(minutes=30)
 HISTORY_PAGE_SIZE: Final = 10  # FR-TXN-09
 HISTORY_MAX_PAGES: Final = 100  # no listing deeper than 1,000 rows; filter by date instead
-CATEGORY_LIST_LIMIT: Final = 100
+CATEGORY_PAGE_SIZE: Final = 20  # buttons per category page (Telegram: at most 100 per message)
+CATEGORY_MAX_PAGES: Final = 100  # 2,000 categories per listing; nobody pages further
 
 # --------------------------------------------------------------------------- defaults
 
@@ -97,6 +101,11 @@ class DraftExpiredError(FinanceError):
 
 class StepError(FinanceError):
     """Input that the current step of the conversation does not expect."""
+
+
+class RetryLaterError(FinanceError):
+    """The request collided with concurrent work and was rolled back as a whole; nothing was
+    stored, and repeating it is safe."""
 
 
 # -------------------------------------------------------------------------- text values
@@ -354,6 +363,12 @@ def validate_page(page: int) -> int:
     return page
 
 
+def validate_category_page(page: int) -> int:
+    if not 0 <= page < CATEGORY_MAX_PAGES:
+        raise InvalidInputError("page")
+    return page
+
+
 @dataclass(frozen=True, slots=True)
 class CurrencyTotals:
     """Cash movement of posted income/expense transactions in one currency."""
@@ -444,6 +459,24 @@ class EditField(StrEnum):
     DATE = "date"
 
 
+class DraftField(StrEnum):
+    """A field of a create draft that can be corrected before saving (FR-TXN-05)."""
+
+    TYPE = "type"
+    AMOUNT = "amount"
+    CATEGORY = "category"
+    DESCRIPTION = "description"
+    DATE = "date"
+
+
+_FIELD_STEP: Final = {
+    DraftField.TYPE: CaptureStep.TYPE,
+    DraftField.AMOUNT: CaptureStep.AMOUNT,
+    DraftField.CATEGORY: CaptureStep.CATEGORY,
+    DraftField.DESCRIPTION: CaptureStep.DESCRIPTION,
+    DraftField.DATE: CaptureStep.DATE,
+}
+
 #: Steps whose input is a typed text message (the others use buttons).
 TEXT_STEPS: Final = frozenset({CaptureStep.AMOUNT, CaptureStep.DESCRIPTION, CaptureStep.DATE})
 
@@ -460,6 +493,7 @@ class CaptureState:
     category_id: UUID | None = None
     description: str | None = None
     description_done: bool = False
+    account_id: UUID | None = None  # resolved when the draft starts (FR-ACC-05)
 
     @classmethod
     def start(
@@ -468,10 +502,12 @@ class CaptureState:
         txn_type: TxnType | None = None,
         amount: ParsedAmount | None = None,
         description: str | None = None,
+        *,
+        account_id: UUID | None = None,
     ) -> "CaptureState":
         if txn_type is not None and txn_type not in CATEGORY_KINDS:
             raise InvalidInputError("txn_type")
-        state = cls(CaptureStep.TYPE, today, txn_type)
+        state = cls(CaptureStep.TYPE, today, txn_type, account_id=account_id)
         if amount is not None:
             state = replace(state, amount=amount.value, rounded=amount.rounded)
         if description is not None:
@@ -496,11 +532,40 @@ class CaptureState:
         if self.step not in steps:
             raise StepError(self.step.value)
 
+    @property
+    def complete_fields(self) -> bool:
+        """Every field has a value: the draft can be (or was) shown for confirmation."""
+        return (
+            self.txn_type is not None
+            and self.amount is not None
+            and self.category_id is not None
+            and self.description_done
+        )
+
+    @property
+    def revising(self) -> bool:
+        """A correction of a complete draft is in progress (offer "back to the summary")."""
+        return self.complete_fields and self.step is not CaptureStep.CONFIRM
+
     def with_type(self, txn_type: TxnType) -> "CaptureState":
         self._expect(CaptureStep.TYPE)
         if txn_type not in CATEGORY_KINDS:
             raise InvalidInputError("txn_type")
-        return replace(self, txn_type=txn_type)._advance()
+        if txn_type is self.txn_type:
+            return self._advance()
+        # A category has a kind (FR-CAT-03): a new type needs a new category.
+        return replace(self, txn_type=txn_type, category_id=None)._advance()
+
+    def revise(self, draft_field: DraftField) -> "CaptureState":
+        """Open one field of the confirmation for correction (FR-TXN-05)."""
+        self._expect(CaptureStep.CONFIRM)
+        return replace(self, step=_FIELD_STEP[draft_field])
+
+    def back(self) -> "CaptureState":
+        """Leave a correction unchanged and return to the confirmation."""
+        if not self.revising:
+            raise StepError(self.step.value)
+        return replace(self, step=CaptureStep.CONFIRM)
 
     def with_amount(self, amount: ParsedAmount) -> "CaptureState":
         self._expect(CaptureStep.AMOUNT)
@@ -519,10 +584,6 @@ class CaptureState:
         return replace(
             self, description=normalize_description(text), description_done=True
         )._advance()
-
-    def asking_date(self) -> "CaptureState":
-        self._expect(CaptureStep.CONFIRM)
-        return replace(self, step=CaptureStep.DATE)
 
     def with_date(self, value: date, today: date) -> "CaptureState":
         self._expect(CaptureStep.DATE)
@@ -550,6 +611,7 @@ class CaptureState:
             "category_id": str(self.category_id) if self.category_id else None,
             "description": self.description,
             "description_done": self.description_done,
+            "account_id": str(self.account_id) if self.account_id else None,
         }
 
     @classmethod
@@ -563,6 +625,7 @@ class CaptureState:
             category_id=UUID(data["category_id"]) if data.get("category_id") else None,
             description=data.get("description"),
             description_done=bool(data.get("description_done")),
+            account_id=UUID(data["account_id"]) if data.get("account_id") else None,
         )
 
 
@@ -696,9 +759,12 @@ class DraftView:
     workspace_name: str
     workspace_kind: str
     currency: str
-    categories: tuple[Category, ...] = ()  # offered at a category step
+    categories: tuple[Category, ...] = ()  # offered at a category step (one page)
     category: Category | None = None  # the chosen one, for the summary
     target: TransactionRecord | None = None  # edit drafts: the transaction being changed
+    account: Account | None = None  # create drafts: the account the transaction will use
+    category_page: int = 0
+    categories_has_next: bool = False
 
 
 class DraftStatus(StrEnum):

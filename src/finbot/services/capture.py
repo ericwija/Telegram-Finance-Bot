@@ -2,32 +2,43 @@
 
 The conversation state lives in PostgreSQL (NFR-AVL-05), never in process memory:
 
-* a ``create`` draft walks type → amount → category → description → confirm (the date can be
-  changed before confirming); an ``edit`` draft changes one field of one posted transaction;
-* each user has at most one pending draft and one pending action per workspace (unique
-  indexes); starting a new conversation cancels the previous one;
-* buttons carry only a short draft reference. The draft itself is always the caller's own
-  pending draft in the active workspace (RLS: ``user_id = app_user_id()``), and a reference
-  that does not match it is stale and refused, so an old keyboard can never act on a newer
-  draft (docs/09 L1);
+* a ``create`` draft walks type → amount → category → description → confirm. Its account is
+  resolved when it starts and stored in the draft (FR-ACC-05), and the confirmation shows it.
+  Every field can be corrected from the confirmation (✏️ Ubah, FR-TXN-05), and every correction
+  returns to the complete confirmation. An ``edit`` draft changes one field of one posted
+  transaction;
+* each user has at most one pending draft and one pending action (a category-name prompt) per
+  workspace (unique indexes); starting a new conversation cancels the previous one;
+* buttons carry only a short reference of the conversation they belong to. The conversation
+  itself is always the caller's own pending one in the active workspace (RLS: ``user_id =
+  app_user_id()``), and a reference that does not match it **exactly** is stale and refused, so
+  an old keyboard can never act on (or cancel) a newer conversation (docs/09 L1);
+* every conversation records the membership version it was started under. After any role or
+  status change (a downgrade, a removal, a removal and rejoin) the version differs and the old
+  conversation is expired instead of revived (R-9, Step 6B R03);
 * **confirm is idempotent** (FR-TXN-06, AT-TXN-IDEMP-01): the draft row is locked ``FOR
   UPDATE`` and moves ``pending → confirmed`` in the same transaction that writes the ledger,
-  so a double tap or a Telegram retry stores exactly one transaction and the second press
-  reports the first one;
-* permission is checked when the draft is confirmed, with the membership of that moment
-  (G-2, R-9): a member downgraded or removed meanwhile is refused, and their draft expires;
-* drafts expire after 24 hours, category-name prompts after 30 minutes.
+  so a double tap or a Telegram retry stores exactly one transaction. A replay reports the
+  transaction only to a caller who still holds the permission, under the same membership,
+  while the transaction is not voided; otherwise it is answered like an expired button;
+* permission is checked when the draft is used, with the membership of that moment (G-2,
+  R-9): a member downgraded or removed meanwhile is refused, and their draft expires;
+* drafts expire after 24 hours, category-name prompts after 30 minutes. An expired
+  conversation is **persisted** as expired before the request is refused (the refusal is
+  raised only after the transaction committed).
 """
 
 import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
+from typing import Any, Final
 from uuid import UUID
 
 from finbot.authz.permissions import Permission
-from finbot.authz.policy import ForbiddenError, authorize
+from finbot.authz.policy import ForbiddenError, allowed, authorize
 from finbot.domain.finance import (
+    CATEGORY_PAGE_SIZE,
     DRAFT_TTL,
     PENDING_ACTION_TTL,
     TEXT_STEPS,
@@ -36,6 +47,7 @@ from finbot.domain.finance import (
     Category,
     ConflictError,
     DraftExpiredError,
+    DraftField,
     DraftPurpose,
     DraftRecord,
     DraftStatus,
@@ -52,20 +64,25 @@ from finbot.domain.finance import (
     draft_ref,
     draft_state,
     parse_date,
+    validate_category_page,
 )
 from finbot.domain.ledger import TxnSource, TxnStatus, TxnType
 from finbot.domain.money import InvalidAmountError, ParsedAmount, parse_amount
-from finbot.ports.finance import FinanceSession
+from finbot.ports.finance import FinanceSession, SessionMode
 from finbot.services.finance import (
     Actor,
     FinanceServiceBase,
     WorkspaceInfo,
     create_transaction,
     update_transaction,
+    visible,
 )
 from finbot.services.ledger import create_category_in, rename_category_in
 
 logger = logging.getLogger(__name__)
+
+#: Key of the membership version in ``drafts.proposal`` and ``pending_actions.payload``.
+MEMBERSHIP_KEY: Final = "membership_version"
 
 
 @dataclass(frozen=True, slots=True)
@@ -83,6 +100,10 @@ class CategoryPrompt:
     action: PendingAction
     workspace: WorkspaceInfo
     category: Category | None  # the category being renamed
+
+    @property
+    def ref(self) -> str:
+        return draft_ref(self.action.id)
 
 
 @dataclass(frozen=True, slots=True)
@@ -113,22 +134,39 @@ def _amount(text: str) -> ParsedAmount:
         raise InvalidInputError(f"amount_{exc.reason.value}") from None
 
 
+def _same_membership(data: dict[str, Any], s: FinanceSession) -> bool:
+    return data.get(MEMBERSHIP_KEY) == s.ctx.membership_version
+
+
 class CaptureService(FinanceServiceBase):
     # -------------------------------------------------------------------- helpers
 
-    async def _view(self, s: FinanceSession, draft_id: UUID, state: DraftState) -> DraftView:
+    @staticmethod
+    def _proposal(s: FinanceSession, state: DraftState) -> dict[str, Any]:
+        return {**state.to_json(), MEMBERSHIP_KEY: s.ctx.membership_version}
+
+    async def _view(
+        self, s: FinanceSession, draft: DraftRecord | UUID, state: DraftState, page: int = 0
+    ) -> DraftView:
+        draft_id = draft if isinstance(draft, UUID) else draft.id
         categories: tuple[Category, ...] = ()
-        txn_type = state.txn_type
-        if state.step is CaptureStep.CATEGORY and txn_type is not None:
-            categories = tuple(await s.list_categories(txn_type))
+        has_next = False
+        if state.step is CaptureStep.CATEGORY and state.txn_type is not None:
+            rows = await s.list_categories(
+                state.txn_type, limit=CATEGORY_PAGE_SIZE + 1, offset=page * CATEGORY_PAGE_SIZE
+            )
+            categories, has_next = tuple(rows[:CATEGORY_PAGE_SIZE]), len(rows) > CATEGORY_PAGE_SIZE
         category = None
         if state.category_id is not None:
             category = await s.get_category(state.category_id)
-        target = None
+        target = account = None
         if isinstance(state, EditState):
-            draft = await s.get_draft(draft_id)
-            if draft is not None and draft.target_transaction_id is not None:
-                target = await s.get_transaction(draft.target_transaction_id)
+            record = draft if isinstance(draft, DraftRecord) else await s.get_draft(draft_id)
+            if record is not None and record.target_transaction_id is not None:
+                target = visible(s, await s.get_transaction(record.target_transaction_id))
+        else:
+            account_id = state.account_id or s.ctx.default_account_id
+            account = None if account_id is None else await s.get_account(account_id)
         return DraftView(
             id=draft_id,
             ref=draft_ref(draft_id),
@@ -139,22 +177,42 @@ class CaptureService(FinanceServiceBase):
             categories=categories,
             category=category,
             target=target,
+            account=account,
+            category_page=page,
+            categories_has_next=has_next,
         )
 
-    async def _pending(self, s: FinanceSession, ref: str | None) -> DraftRecord | None:
-        """The caller's pending draft (locked), or None if missing, stale or expired.
+    async def _pending(self, s: FinanceSession, ref: str | None) -> tuple[DraftRecord | None, bool]:
+        """(the caller's pending draft, locked and authorized; whether it just expired).
 
-        An expired draft is marked ``expired`` here; the caller must then raise
-        :class:`DraftExpiredError` *after* the session commits.
+        A draft whose reference differs is stale (None, False) and is left alone. A draft past
+        its expiry is marked ``expired`` (None, True). Otherwise the caller must hold the
+        draft's permission now (ForbiddenError, audited; R-9), and a draft started under an
+        earlier membership (an upgrade, a removal and rejoin) is marked ``expired`` too. The
+        caller must let the session commit and raise only afterwards.
         """
         draft = await s.pending_draft(for_update=True)
         if draft is None or (ref is not None and draft_ref(draft.id) != ref):
-            return None
-        if draft.expires_at <= self._clock():
-            await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
-            logger.info("draft expired", extra={"event": "draft.expired"})
-            return None
-        return draft
+            return None, False
+        if draft.expires_at > self._clock():
+            authorize(s.ctx, _permission_for(draft_state(draft.proposal)))
+            if _same_membership(draft.proposal, s):
+                return draft, False
+        await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
+        logger.info("draft expired", extra={"event": "draft.expired"})
+        return None, True
+
+    async def _pending_action(self, s: FinanceSession) -> tuple[PendingAction | None, bool]:
+        """As :meth:`_pending`, for the caller's pending category-name prompt."""
+        action = await s.pending_action(for_update=True)
+        if action is None:
+            return None, False
+        if action.expires_at > self._clock():
+            authorize(s.ctx, Permission.CATEGORY_MANAGE)
+            if _same_membership(action.payload, s):
+                return action, False
+        await s.set_pending_action_status(action.id, "expired")
+        return None, True
 
     async def _start_draft(
         self,
@@ -170,7 +228,7 @@ class CaptureService(FinanceServiceBase):
         await s.cancel_pending_actions()
         draft_id = await s.insert_draft(
             purpose,
-            state.to_json(),
+            self._proposal(s, state),
             TxnSource.MANUAL,
             self._clock() + DRAFT_TTL,
             target_transaction_id=target,
@@ -178,21 +236,19 @@ class CaptureService(FinanceServiceBase):
         )
         return await self._view(s, draft_id, state)
 
-    async def _step(self, actor: Actor, ref: str, update: _Update) -> DraftView:
+    async def _step(self, actor: Actor, ref: str, update: _Update, page: int = 0) -> DraftView:
         """Load the pending draft ``ref``, authorize for its purpose, apply ``update``, save."""
         try:
-            async with self._session(actor, None, write=True) as s:
-                draft = await self._pending(s, ref)
+            async with self._session(actor, None, write=True, entity="draft") as s:
+                draft, _ = await self._pending(s, ref)
                 if draft is not None:
-                    state = draft_state(draft.proposal)
-                    authorize(s.ctx, _permission_for(state))
-                    state = await update(s, state, self._today(s.ctx))
-                    await s.update_draft(draft.id, state.to_json())
-                    return await self._view(s, draft.id, state)
+                    state = await update(s, draft_state(draft.proposal), self._today(s.ctx))
+                    await s.update_draft(draft.id, self._proposal(s, state))
+                    return await self._view(s, draft, state, page)
         except ForbiddenError:
             await self._expire_after_denial(actor)
             raise
-        raise DraftExpiredError("draft")
+        raise DraftExpiredError("draft")  # stale, expired (now persisted) or gone
 
     # --------------------------------------------------------------------- create
 
@@ -207,8 +263,16 @@ class CaptureService(FinanceServiceBase):
     ) -> DraftView:
         """Begin a new transaction draft (``/catat``, ``/pemasukan``, ``/pengeluaran``)."""
         amount = _amount(amount_text) if amount_text else None
-        async with self._session(actor, Permission.TRANSACTION_CREATE, write=True) as s:
-            state = CaptureState.start(self._today(s.ctx), txn_type, amount, description)
+        async with self._session(
+            actor, Permission.TRANSACTION_CREATE, write=True, entity="draft"
+        ) as s:
+            state = CaptureState.start(
+                self._today(s.ctx),
+                txn_type,
+                amount,
+                description,
+                account_id=s.ctx.default_account_id,
+            )
             view = await self._start_draft(s, DraftPurpose.CREATE, state, chat_id=chat_id)
         logger.info("draft started", extra={"event": "draft.created"})
         return view
@@ -232,6 +296,17 @@ class CaptureService(FinanceServiceBase):
 
         return await self._step(actor, ref, update)
 
+    async def category_page(self, actor: Actor, ref: str, page: int) -> DraftView:
+        """Another page of the category step (every category is reachable, F06)."""
+        validate_category_page(page)
+
+        async def update(_: FinanceSession, state: DraftState, today: date) -> DraftState:
+            if state.step is not CaptureStep.CATEGORY:
+                raise StepError(state.step.value)
+            return state
+
+        return await self._step(actor, ref, update, page)
+
     async def skip_description(self, actor: Actor, ref: str) -> DraftView:
         """No description (create) or remove the description (edit)."""
 
@@ -240,24 +315,59 @@ class CaptureService(FinanceServiceBase):
 
         return await self._step(actor, ref, update)
 
-    async def ask_date(self, actor: Actor, ref: str) -> DraftView:
+    async def review(self, actor: Actor, ref: str) -> DraftView:
+        """The confirmation of a complete create draft, to choose a field to correct."""
+
+        async def update(_: FinanceSession, state: DraftState, today: date) -> DraftState:
+            if not isinstance(state, CaptureState) or state.step is not CaptureStep.CONFIRM:
+                raise StepError(state.step.value)
+            return state
+
+        return await self._step(actor, ref, update)
+
+    async def revise(self, actor: Actor, ref: str, draft_field: DraftField) -> DraftView:
+        """Open one field of a complete create draft for correction (FR-TXN-05)."""
+
         async def update(_: FinanceSession, state: DraftState, today: date) -> DraftState:
             if not isinstance(state, CaptureState):
-                raise StepError("date")
-            return state.asking_date()
+                raise StepError(state.step.value)
+            return state.revise(draft_field)
+
+        return await self._step(actor, ref, update)
+
+    async def back(self, actor: Actor, ref: str) -> DraftView:
+        """Leave a correction unchanged and show the confirmation again."""
+
+        async def update(_: FinanceSession, state: DraftState, today: date) -> DraftState:
+            if not isinstance(state, CaptureState):
+                raise StepError(state.step.value)
+            return state.back()
 
         return await self._step(actor, ref, update)
 
     async def current(self, actor: Actor) -> DraftView | CategoryPrompt | None:
-        """The conversation in progress, if any (to re-render after an error)."""
+        """The conversation in progress, if any and still usable by the caller (read only)."""
         async with self._session(actor, None) as s:
             action = await s.pending_action()
-            if action is not None and action.expires_at > self._clock():
+            if (
+                action is not None
+                and action.expires_at > self._clock()
+                and _same_membership(action.payload, s)
+            ):
+                if not allowed(s.ctx, Permission.CATEGORY_MANAGE):
+                    return None
                 return await self._prompt(s, action)
             draft = await s.pending_draft()
-            if draft is None or draft.expires_at <= self._clock():
+            if (
+                draft is None
+                or draft.expires_at <= self._clock()
+                or not _same_membership(draft.proposal, s)
+            ):
                 return None
-            return await self._view(s, draft.id, draft_state(draft.proposal))
+            state = draft_state(draft.proposal)
+            if not allowed(s.ctx, _permission_for(state)):
+                return None
+            return await self._view(s, draft, state)
 
     # ------------------------------------------------------------------ text input
 
@@ -270,32 +380,21 @@ class CaptureService(FinanceServiceBase):
             raise
 
     async def _input_text(self, actor: Actor, text: str) -> TextOutcome:
-        expired = False
-        async with self._session(actor, None, write=True) as s:
+        async with self._session(actor, None, write=True, entity="draft") as s:
             today = self._today(s.ctx)
-            action = await s.pending_action(for_update=True)
+            action, expired = await self._pending_action(s)
             if action is not None:
-                if action.expires_at <= self._clock():
-                    await s.set_pending_action_status(action.id, "expired")
-                    expired = True
-                else:
-                    return await self._complete_action(s, action, text)
-            else:
-                draft = await s.pending_draft(for_update=True)
-                if draft is None:
-                    return None
-                if draft.expires_at <= self._clock():
-                    await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
-                    expired = True
-                else:
+                return await self._complete_action(s, action, text)
+            if not expired:
+                draft, expired = await self._pending(s, None)
+                if draft is not None:
                     state = draft_state(draft.proposal)
-                    authorize(s.ctx, _permission_for(state))
                     if state.step not in TEXT_STEPS:
                         raise StepError(state.step.value)
                     state = self._apply_text(state, text, today)
-                    await s.update_draft(draft.id, state.to_json())
-                    return await self._view(s, draft.id, state)
-        if expired:
+                    await s.update_draft(draft.id, self._proposal(s, state))
+                    return await self._view(s, draft, state)
+        if expired:  # persisted above; refused only now that it is committed
             raise DraftExpiredError("conversation")
         return None
 
@@ -316,78 +415,117 @@ class CaptureService(FinanceServiceBase):
     async def confirm(self, actor: Actor, ref: str) -> ConfirmResult:
         failure: FinanceError | None = None
         try:
-            async with self._session(actor, None, write=True) as s:
+            async with self._session(actor, None, write=True, entity="transaction") as s:
                 today = self._today(s.ctx)
-                draft = await self._pending(s, ref)
+                draft, expired = await self._pending(s, ref)
                 if draft is None:
-                    return await self._already_confirmed(s, ref)
-                state = draft_state(draft.proposal)
-                try:
-                    if isinstance(state, EditState):
-                        if draft.target_transaction_id is None:  # pragma: no cover - CHECK
-                            raise ConflictError("edit_without_target")
-                        record = await update_transaction(
-                            s,
-                            draft.target_transaction_id,
-                            state.expected_version,
-                            state.changes(),
-                            today=today,
-                        )
-                    else:
-                        txn_type, amount, category_id = state.complete()
-                        record = await create_transaction(
-                            s,
-                            txn_type=txn_type,
-                            amount=amount,
-                            txn_date=state.txn_date,
-                            category_id=category_id,
-                            description=state.description,
-                            source=TxnSource.MANUAL,
-                            today=today,
-                        )
-                except (ConflictError, NotFoundError) as exc:
-                    # The target changed or disappeared: this draft can never succeed.
-                    await s.set_draft_status(draft.id, DraftStatus.CANCELLED)
-                    failure = exc
+                    replay = DraftExpiredError("draft") if expired else await self._replay(s, ref)
+                    if isinstance(replay, ConfirmResult):
+                        return replay
+                    failure = replay  # raised after the commit (an expiry must persist)
                 else:
-                    await s.set_draft_status(draft.id, DraftStatus.CONFIRMED, record.id)
-                    logger.info("draft confirmed", extra={"event": "draft.confirmed"})
-                    return ConfirmResult(record, draft.purpose, False, WorkspaceInfo.of(s.ctx))
+                    try:
+                        record = await self._apply(s, draft, draft_state(draft.proposal), today)
+                    except (ConflictError, NotFoundError) as exc:
+                        # The target changed or disappeared: this draft can never succeed.
+                        await s.set_draft_status(draft.id, DraftStatus.CANCELLED)
+                        failure = exc
+                    else:
+                        await s.set_draft_status(draft.id, DraftStatus.CONFIRMED, record.id)
+                        logger.info(
+                            "draft confirmed",
+                            extra={"event": "draft.confirmed", "request_id": actor.request_id},
+                        )
+                        return ConfirmResult(record, draft.purpose, False, WorkspaceInfo.of(s.ctx))
         except ForbiddenError:
             await self._expire_after_denial(actor)
             raise
-        if failure is not None:
-            raise failure
-        raise AssertionError("unreachable")  # pragma: no cover
+        if failure is None:  # pragma: no cover - every branch above returns or sets it
+            raise AssertionError("unreachable")
+        raise failure
 
-    async def _already_confirmed(self, s: FinanceSession, ref: str) -> ConfirmResult:
+    @staticmethod
+    async def _apply(
+        s: FinanceSession, draft: DraftRecord, state: DraftState, today: date
+    ) -> TransactionRecord:
+        if isinstance(state, EditState):
+            if draft.target_transaction_id is None:  # pragma: no cover - CHECK constraint
+                raise ConflictError("edit_without_target")
+            return await update_transaction(
+                s, draft.target_transaction_id, state.expected_version, state.changes(), today=today
+            )
+        txn_type, amount, category_id = state.complete()
+        return await create_transaction(
+            s,
+            txn_type=txn_type,
+            amount=amount,
+            txn_date=state.txn_date,
+            category_id=category_id,
+            description=state.description,
+            source=TxnSource.MANUAL,
+            today=today,
+            account_id=state.account_id,
+        )
+
+    async def _replay(self, s: FinanceSession, ref: str) -> ConfirmResult | FinanceError:
+        """A second ✅ of an already confirmed draft (double tap, retry, restart).
+
+        Re-authorized now: the caller must still hold the draft's permission (refused and
+        audited otherwise) and the same membership; a voided result is not shown. Anything
+        else is answered like an expired button, without details.
+        """
         draft = await s.find_draft_by_ref(ref)
-        if draft is None or draft.status is not DraftStatus.CONFIRMED:
-            raise DraftExpiredError("draft")
-        if draft.confirmed_txn_id is None:  # pragma: no cover - CHECK constraint
-            raise DraftExpiredError("draft")
+        if (
+            draft is None
+            or draft.status is not DraftStatus.CONFIRMED
+            or draft.confirmed_txn_id is None
+        ):
+            return DraftExpiredError("draft")
+        authorize(s.ctx, _permission_for(draft_state(draft.proposal)))
+        authorize(s.ctx, Permission.TRANSACTION_VIEW)
+        if not _same_membership(draft.proposal, s):
+            return DraftExpiredError("draft")
         record = await s.get_transaction(draft.confirmed_txn_id)
-        if record is None:  # pragma: no cover - FK
-            raise DraftExpiredError("draft")
+        if record is None or record.status is not TxnStatus.POSTED:
+            return DraftExpiredError("draft")
         return ConfirmResult(record, draft.purpose, True, WorkspaceInfo.of(s.ctx))
 
     async def _expire_after_denial(self, actor: Actor) -> None:
-        """R-9 / docs/08 §6: a member who lost the permission loses their pending draft."""
+        """R-9 / docs/08 §6: a member who lost the permission loses their pending
+        conversation (the draft and any category prompt)."""
         try:
-            async with self._store.session(actor.user_id, actor.workspace_id, write=True) as s:
+            async with self._store.session(
+                actor.user_id,
+                actor.workspace_id,
+                mode=SessionMode.WRITE,
+                request_id=actor.request_id,
+            ) as s:
                 draft = await s.pending_draft(for_update=True)
                 if draft is not None:
                     await s.set_draft_status(draft.id, DraftStatus.EXPIRED)
+                action = await s.pending_action(for_update=True)
+                if action is not None:
+                    await s.set_pending_action_status(action.id, "expired")
         except NotFoundError:
             return  # no longer a member at all: nothing visible to expire
 
     async def cancel(self, actor: Actor, ref: str | None = None) -> bool:
-        """Cancel the pending draft (``ref`` must match it if given) and any pending action."""
-        async with self._session(actor, None, write=True) as s:
-            cancelled = await s.cancel_pending_actions() > 0
+        """``/batal`` (``ref`` None): cancel the conversation in progress, whatever it is.
+
+        A ❌ button (``ref`` given) cancels only the conversation it belongs to: the pending
+        draft or the pending category prompt whose reference is exactly ``ref``. A stale ❌ of
+        an older conversation changes nothing (F08).
+        """
+        cancelled = False
+        async with self._session(actor, None, write=True, entity="draft") as s:
+            await s.lock_conversation()
             draft = await s.pending_draft(for_update=True)
             if draft is not None and (ref is None or draft_ref(draft.id) == ref):
                 await s.set_draft_status(draft.id, DraftStatus.CANCELLED)
+                cancelled = True
+            action = await s.pending_action(for_update=True)
+            if action is not None and (ref is None or draft_ref(action.id) == ref):
+                await s.set_pending_action_status(action.id, "cancelled")
                 cancelled = True
         if cancelled:
             logger.info("draft cancelled", extra={"event": "draft.cancelled"})
@@ -398,8 +536,10 @@ class CaptureService(FinanceServiceBase):
     async def start_edit(
         self, actor: Actor, transaction_id: UUID, expected_version: int, field: EditField
     ) -> DraftView:
-        async with self._session(actor, Permission.TRANSACTION_UPDATE, write=True) as s:
-            record = await s.get_transaction(transaction_id)
+        async with self._session(
+            actor, Permission.TRANSACTION_UPDATE, write=True, entity="transaction"
+        ) as s:
+            record = visible(s, await s.get_transaction(transaction_id))
             if record is None:
                 raise NotFoundError("transaction")
             if record.status is not TxnStatus.POSTED:
@@ -418,13 +558,17 @@ class CaptureService(FinanceServiceBase):
         return CategoryPrompt(action, WorkspaceInfo.of(s.ctx), category)
 
     async def start_category_create(self, actor: Actor, kind: TxnType) -> CategoryPrompt:
-        async with self._session(actor, Permission.CATEGORY_MANAGE, write=True) as s:
-            if kind not in (TxnType.INCOME, TxnType.EXPENSE):
-                raise InvalidInputError("category_kind")
+        if kind not in (TxnType.INCOME, TxnType.EXPENSE):
+            raise InvalidInputError("category_kind")
+        async with self._session(
+            actor, Permission.CATEGORY_MANAGE, write=True, entity="category"
+        ) as s:
             return await self._new_action(s, PendingKind.CATEGORY_CREATE, {"kind": kind.value})
 
     async def start_category_rename(self, actor: Actor, category_id: UUID) -> CategoryPrompt:
-        async with self._session(actor, Permission.CATEGORY_MANAGE, write=True) as s:
+        async with self._session(
+            actor, Permission.CATEGORY_MANAGE, write=True, entity="category"
+        ) as s:
             if await s.get_category(category_id) is None:
                 raise NotFoundError("category")
             return await self._new_action(
@@ -432,12 +576,13 @@ class CaptureService(FinanceServiceBase):
             )
 
     async def _new_action(
-        self, s: FinanceSession, kind: PendingKind, payload: dict[str, str]
+        self, s: FinanceSession, kind: PendingKind, payload: dict[str, Any]
     ) -> CategoryPrompt:
         await s.lock_conversation()
         await s.cancel_pending_actions()
         await s.cancel_pending_drafts()
         expires = self._clock() + PENDING_ACTION_TTL
+        payload = {**payload, MEMBERSHIP_KEY: s.ctx.membership_version}
         action_id = await s.insert_pending_action(kind, payload, expires)
         return await self._prompt(s, PendingAction(action_id, kind, expires, payload))
 

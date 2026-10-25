@@ -93,7 +93,7 @@ async def test_expired_and_stale_drafts(w: World) -> None:
     old = await w.capture.start(w.actor, E)
     new = await w.capture.start(w.actor, INC)
     with pytest.raises(DraftExpiredError):
-        await w.capture.ask_date(w.actor, old.ref)
+        await w.capture.choose_type(w.actor, old.ref, E)
     w.clock.advance(hours=25)
     with pytest.raises(DraftExpiredError):
         await w.capture.input_text(w.actor, "1000")
@@ -135,8 +135,8 @@ async def test_categories(w: World) -> None:
     assert (await w.ledger.category(w.actor, kopi.id)) == (kopi, True)
     assert (await w.ledger.set_category_active(w.actor, kopi.id, False)).archived
     assert (await w.ledger.set_category_active(w.actor, kopi.id, False)).archived  # no-op
-    listing = await w.ledger.categories(w.actor, E, include_archived=True)
-    assert any(c.archived for c in listing.categories)
+    listing = await w.ledger.categories(w.actor, E, archived=True)
+    assert [c.name for c in listing.categories] == ["Kopi"]
     with pytest.raises(NotFoundError):
         await w.ledger.category(w.actor, uuid.uuid4())
     with pytest.raises(NotFoundError):

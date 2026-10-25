@@ -2,12 +2,16 @@
 
 ``FakeBotApi`` is plugged into ``ApplicationBuilder.request(...)``; every Bot API call is
 recorded and answered locally. Errors are produced the way Telegram produces them (HTTP status
-plus ``{"ok": false, ...}``), so PTB raises its real exception types.
+plus ``{"ok": false, ...}``), so PTB raises its real exception types. Like Telegram, it refuses
+a message longer than 4,096 characters after entity parsing, more than 100 inline buttons and
+callback data over 64 bytes (``rejected`` lists those refusals).
 """
 
 import asyncio
+import html
 import itertools
 import json
+import re
 from collections.abc import Callable
 from typing import Any
 
@@ -22,6 +26,27 @@ BOT_USERNAME = "finbot_test_bot"
 BOT_TOKEN = "5000000001:AAtest-not-a-real-token-0123456789abcdef"
 _BOT_USER = {"id": BOT_ID, "is_bot": True, "first_name": "Finbot", "username": BOT_USERNAME}
 _ids = itertools.count(1)
+TEXT_LIMIT = 4096
+BUTTON_LIMIT = 100
+CALLBACK_DATA_LIMIT = 64
+
+
+def _limit_error(params: dict[str, Any]) -> str | None:
+    """Telegram's refusal of an oversized message or keyboard, or None."""
+    text = params.get("text")
+    if isinstance(text, str):
+        visible = html.unescape(re.sub(r"<[^>]*>", "", text))
+        if len(visible.encode("utf-16-le")) // 2 > TEXT_LIMIT:
+            return "Bad Request: message is too long"
+    markup = params.get("reply_markup") or {}
+    if isinstance(markup, str):
+        markup = json.loads(markup)
+    buttons = [b for row in markup.get("inline_keyboard", []) for b in row]
+    if len(buttons) > BUTTON_LIMIT:
+        return "Bad Request: reply markup is too long"
+    if any(len(b.get("callback_data", "").encode()) > CALLBACK_DATA_LIMIT for b in buttons):
+        return "Bad Request: BUTTON_DATA_INVALID"
+    return None
 
 
 class FakeBotApi(BaseRequest):
@@ -29,6 +54,7 @@ class FakeBotApi(BaseRequest):
         self.calls: list[tuple[str, dict[str, Any]]] = []
         #: endpoint -> (HTTP status, description) to fail with
         self.failures: dict[str, tuple[int, str]] = {}
+        self.rejected: list[str] = []
 
     @property
     def read_timeout(self) -> float | None:
@@ -57,6 +83,11 @@ class FakeBotApi(BaseRequest):
             status, description = self.failures[endpoint]
             body = {"ok": False, "error_code": status, "description": description}
             return status, json.dumps(body).encode()
+        if endpoint in ("sendMessage", "editMessageText") and (error := _limit_error(params)):
+            self.calls[-1] = (f"{endpoint}:rejected", params)  # never "shown" to the user
+            self.rejected.append(error)
+            body = {"ok": False, "error_code": 400, "description": error}
+            return 400, json.dumps(body).encode()
         result: Any = True
         if endpoint == "getMe":
             result = _BOT_USER

@@ -4,7 +4,13 @@ Every method is one unit of work; authorization happens inside it (docs/08 §1).
 another workspace is simply not found in the context workspace, so it is reported exactly like
 a missing one (G-3). Reports are SQL aggregates over posted headers (cash flow) or current
 entries (balances); transfers never count as income or expense, voided transactions never
-count, and currencies are reported separately (docs/05 §7).
+count, and currencies are reported separately (docs/05 §7). A report is read in one
+``REPEATABLE READ READ ONLY`` session, so its balances, totals and category breakdown all come
+from the same committed snapshot and always reconcile, even while others post.
+
+Category names change only under the workspace's category-name lock, after a duplicate check:
+a duplicate is reported as :class:`DuplicateNameError` without ever violating the unique index,
+whose error detail would otherwise put the name into the PostgreSQL server log (docs/09 §10).
 """
 
 import logging
@@ -15,7 +21,7 @@ from uuid import UUID
 from finbot.authz.permissions import Permission
 from finbot.authz.policy import allowed, authorize
 from finbot.domain.finance import (
-    CATEGORY_LIST_LIMIT,
+    CATEGORY_PAGE_SIZE,
     HISTORY_PAGE_SIZE,
     BalanceReport,
     Category,
@@ -32,6 +38,7 @@ from finbot.domain.finance import (
     category_key,
     category_kind,
     normalize_category_name,
+    validate_category_page,
     validate_page,
 )
 from finbot.domain.ledger import TxnStatus, TxnType
@@ -42,6 +49,7 @@ from finbot.services.finance import (
     WorkspaceInfo,
     set_voided,
     update_transaction,
+    visible,
 )
 
 logger = logging.getLogger(__name__)
@@ -49,9 +57,15 @@ logger = logging.getLogger(__name__)
 
 @dataclass(frozen=True, slots=True)
 class CategoryListing:
+    """One page of categories (``archived``: the "nonaktif" view)."""
+
     workspace: WorkspaceInfo
     categories: tuple[Category, ...]
     can_manage: bool
+    kind: TxnType | None = None
+    archived: bool = False
+    page: int = 0
+    has_next: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,6 +100,7 @@ async def create_category_in(s: FinanceSession, kind: TxnType, name: str) -> Cat
     authorize(s.ctx, Permission.CATEGORY_MANAGE)
     kind = category_kind(kind)
     clean = normalize_category_name(name)
+    await s.lock_category_names()
     if await s.find_active_category(kind, clean) is not None:
         raise DuplicateNameError(clean)
     category = await s.insert_category(kind, clean)
@@ -97,10 +112,11 @@ async def create_category_in(s: FinanceSession, kind: TxnType, name: str) -> Cat
 
 async def rename_category_in(s: FinanceSession, category_id: UUID, name: str) -> Category:
     authorize(s.ctx, Permission.CATEGORY_MANAGE)
-    category = await s.get_category(category_id, for_update=True)
+    clean = normalize_category_name(name)
+    await s.lock_category_names()
+    category = await s.get_category(category_id, lock="update")
     if category is None:
         raise NotFoundError("category")
-    clean = normalize_category_name(name)
     if clean == category.name:
         raise InvalidInputError("no_changes")
     other = await s.find_active_category(category.kind, clean)
@@ -130,46 +146,69 @@ class LedgerService(FinanceServiceBase):
     # ----------------------------------------------------------------- categories
 
     async def categories(
-        self, actor: Actor, kind: TxnType | None = None, *, include_archived: bool = False
+        self,
+        actor: Actor,
+        kind: TxnType | None = None,
+        *,
+        archived: bool = False,
+        page: int = 0,
     ) -> CategoryListing:
+        """One page of active (or, with ``archived``, only deactivated) categories."""
+        validate_category_page(page)
+        if kind is not None:
+            category_kind(kind)
         async with self._session(actor, Permission.CATEGORY_VIEW) as s:
-            if kind is not None:
-                category_kind(kind)
             items = await s.list_categories(
-                kind, include_archived=include_archived, limit=CATEGORY_LIST_LIMIT
+                kind,
+                archived=archived,
+                limit=CATEGORY_PAGE_SIZE + 1,
+                offset=page * CATEGORY_PAGE_SIZE,
             )
             return CategoryListing(
                 WorkspaceInfo.of(s.ctx),
-                tuple(items),
+                tuple(items[:CATEGORY_PAGE_SIZE]),
                 allowed(s.ctx, Permission.CATEGORY_MANAGE),
+                kind,
+                archived,
+                page,
+                len(items) > CATEGORY_PAGE_SIZE,
             )
 
     async def category(self, actor: Actor, category_id: UUID) -> tuple[Category, bool]:
         """A category of the context workspace and whether the caller may manage it."""
-        async with self._session(actor, Permission.CATEGORY_VIEW) as s:
+        async with self._session(actor, Permission.CATEGORY_VIEW, entity="category") as s:
             category = await s.get_category(category_id)
             if category is None:
                 raise NotFoundError("category")
             return category, allowed(s.ctx, Permission.CATEGORY_MANAGE)
 
     async def create_category(self, actor: Actor, kind: TxnType, name: str) -> Category:
-        async with self._session(actor, Permission.CATEGORY_MANAGE, write=True) as s:
+        async with self._session(
+            actor, Permission.CATEGORY_MANAGE, write=True, entity="category"
+        ) as s:
             return await create_category_in(s, kind, name)
 
     async def rename_category(self, actor: Actor, category_id: UUID, name: str) -> Category:
-        async with self._session(actor, Permission.CATEGORY_MANAGE, write=True) as s:
+        async with self._session(
+            actor, Permission.CATEGORY_MANAGE, write=True, entity="category"
+        ) as s:
             return await rename_category_in(s, category_id, name)
 
     async def set_category_active(self, actor: Actor, category_id: UUID, active: bool) -> Category:
         """Deactivate (archive) or reactivate. Old transactions keep the category (FR-CAT-04)."""
-        async with self._session(actor, Permission.CATEGORY_MANAGE, write=True) as s:
-            category = await s.get_category(category_id, for_update=True)
+        async with self._session(
+            actor, Permission.CATEGORY_MANAGE, write=True, entity="category"
+        ) as s:
+            await s.lock_category_names()
+            category = await s.get_category(category_id, lock="update")
             if category is None:
                 raise NotFoundError("category")
             if category.archived == (not active):
                 return category
             if category.is_default and not active:
                 raise InvalidInputError("category_default")  # the "Lainnya" fallback stays
+            if active and await s.find_active_category(category.kind, category.name):
+                raise DuplicateNameError(category.name)  # an active namesake exists
             updated = await s.set_category_archived(category_id, not active)
             if updated is None:  # reactivating collides with an active namesake
                 raise DuplicateNameError(category.name)
@@ -184,12 +223,9 @@ class LedgerService(FinanceServiceBase):
     # --------------------------------------------------------------- transactions
 
     async def transaction(self, actor: Actor, transaction_id: UUID) -> TransactionDetail:
-        async with self._session(actor, Permission.TRANSACTION_VIEW) as s:
-            record = await s.get_transaction(transaction_id)
-            if record is None or (
-                record.status is TxnStatus.VOIDED
-                and not allowed(s.ctx, Permission.TRANSACTION_VIEW_DELETED)
-            ):
+        async with self._session(actor, Permission.TRANSACTION_VIEW, entity="transaction") as s:
+            record = visible(s, await s.get_transaction(transaction_id))
+            if record is None:
                 raise NotFoundError("transaction")
             posted = record.status is TxnStatus.POSTED
             return TransactionDetail(
@@ -209,7 +245,7 @@ class LedgerService(FinanceServiceBase):
             if history_filter.voided
             else Permission.TRANSACTION_VIEW
         )
-        async with self._session(actor, permission) as s:
+        async with self._session(actor, permission, entity="transaction") as s:
             category = None
             if history_filter.category_id is not None:
                 category = await s.get_category(history_filter.category_id)
@@ -236,7 +272,9 @@ class LedgerService(FinanceServiceBase):
         expected_version: int,
         changes: TransactionChanges,
     ) -> TransactionRecord:
-        async with self._session(actor, Permission.TRANSACTION_UPDATE, write=True) as s:
+        async with self._session(
+            actor, Permission.TRANSACTION_UPDATE, write=True, entity="transaction"
+        ) as s:
             return await update_transaction(
                 s, transaction_id, expected_version, changes, today=self._today(s.ctx)
             )
@@ -244,7 +282,9 @@ class LedgerService(FinanceServiceBase):
     async def void_transaction(
         self, actor: Actor, transaction_id: UUID, expected_version: int, reason: str | None = None
     ) -> TransactionRecord:
-        async with self._session(actor, Permission.TRANSACTION_DELETE, write=True) as s:
+        async with self._session(
+            actor, Permission.TRANSACTION_DELETE, write=True, entity="transaction"
+        ) as s:
             return await set_voided(
                 s, transaction_id, expected_version, voided=True, now=self._clock(), reason=reason
             )
@@ -252,7 +292,9 @@ class LedgerService(FinanceServiceBase):
     async def restore_transaction(
         self, actor: Actor, transaction_id: UUID, expected_version: int
     ) -> TransactionRecord:
-        async with self._session(actor, Permission.TRANSACTION_RESTORE, write=True) as s:
+        async with self._session(
+            actor, Permission.TRANSACTION_RESTORE, write=True, entity="transaction"
+        ) as s:
             return await set_voided(
                 s, transaction_id, expected_version, voided=False, now=self._clock()
             )

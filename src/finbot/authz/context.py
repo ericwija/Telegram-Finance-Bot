@@ -23,3 +23,7 @@ class WorkspaceContext:
     currency: str
     role: str  # owner | admin | editor | viewer
     default_account_id: UUID | None
+    #: ``workspace_memberships.version``: changes with every role or status change (revision
+    #: 0005 enforces it), so a conversation started under an earlier membership is recognised
+    #: as stale after a downgrade, a removal or a removal and rejoin (R-9).
+    membership_version: int = 1

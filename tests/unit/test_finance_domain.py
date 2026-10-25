@@ -13,6 +13,7 @@ from finbot.domain.finance import (
     CaptureState,
     CaptureStep,
     Category,
+    DraftField,
     EditField,
     EditState,
     HistoryFilter,
@@ -174,9 +175,42 @@ def test_capture_walks_type_amount_category_description_confirm() -> None:
     state = state.with_description("Makan siang")
     assert state.step is CaptureStep.CONFIRM
     assert state.complete() == (TxnType.EXPENSE, 25_000, category.id)
-    state = state.asking_date().with_date(date(2026, 10, 20), TODAY)
+    state = state.revise(DraftField.DATE).with_date(date(2026, 10, 20), TODAY)
     assert (state.step, state.txn_date) == (CaptureStep.CONFIRM, date(2026, 10, 20))
     assert draft_state(state.to_json()) == state
+
+
+def test_F10_every_correction_returns_to_the_complete_confirmation() -> None:
+    account = uuid.uuid4()
+    state = CaptureState.start(
+        TODAY, TxnType.EXPENSE, ParsedAmount(Rupiah(25_000), rounded=False), "kopi",
+        account_id=account,
+    ).with_category(_category())  # fmt: skip
+    assert state.step is CaptureStep.CONFIRM
+    amount = state.revise(DraftField.AMOUNT)
+    assert amount.revising
+    amount = amount.with_amount(ParsedAmount(Rupiah(40_000), rounded=False))
+    assert (amount.step, amount.amount) == (CaptureStep.CONFIRM, 40_000)
+    other = _category()
+    category = state.revise(DraftField.CATEGORY).with_category(other)
+    assert (category.step, category.category_id) == (CaptureStep.CONFIRM, other.id)
+    description = state.revise(DraftField.DESCRIPTION).with_description(None)
+    assert (description.step, description.description) == (CaptureStep.CONFIRM, None)
+    same_type = state.revise(DraftField.TYPE).with_type(TxnType.EXPENSE)
+    assert same_type == state  # nothing lost
+    new_type = state.revise(DraftField.TYPE).with_type(TxnType.INCOME)
+    assert (new_type.step, new_type.category_id) == (CaptureStep.CATEGORY, None)  # FR-CAT-03
+    income = new_type.with_category(_category(TxnType.INCOME))
+    assert income.step is CaptureStep.CONFIRM
+    assert state.revise(DraftField.DATE).back() == state
+    assert income.account_id == account  # the resolved account never changes
+    assert draft_state(income.to_json()) == income
+    with pytest.raises(StepError):
+        state.back()  # nothing to go back from
+    with pytest.raises(StepError):
+        CaptureState.start(TODAY, TxnType.EXPENSE).back()  # incomplete: no summary yet
+    with pytest.raises(StepError):
+        amount.revise(DraftField.TYPE).revise(DraftField.AMOUNT)  # one correction at a time
 
 
 def test_capture_shortcuts_skip_answered_steps() -> None:
@@ -203,7 +237,7 @@ def test_capture_rejects_out_of_order_and_mismatched_input() -> None:
         CaptureState.start(TODAY, TxnType.TRANSFER)
     done = state.with_category(_category()).with_description(None)
     with pytest.raises(InvalidInputError, match="date_in_future"):
-        done.asking_date().with_date(date(2026, 10, 26), TODAY)
+        done.revise(DraftField.DATE).with_date(date(2026, 10, 26), TODAY)
 
 
 def test_edit_state_produces_exactly_one_change() -> None:

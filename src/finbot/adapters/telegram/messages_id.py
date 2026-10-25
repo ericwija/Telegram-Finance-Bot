@@ -60,12 +60,12 @@ HELP: Final = (
     "/riwayat (/transaksi) [pemasukan|pengeluaran|dihapus] [bulan|tanggal tanggal] — riwayat\n"
     "/saldo — saldo tercatat per akun\n"
     "/laporan (/ringkasan) [bulan] — ringkasan bulanan\n"
-    "/kategori [pemasukan|pengeluaran] — kelola kategori\n"
+    "/kategori [pemasukan|pengeluaran] [nonaktif] — kelola kategori\n"
     "/batal — batalkan percakapan yang sedang berjalan\n"
     "/bantuan — tampilkan bantuan ini\n\n"
     "Contoh: <code>/pengeluaran 25rb makan siang</code>, <code>/laporan bulan lalu</code>, "
     "<code>/riwayat 2026-10</code>.\n"
-    "Jumlah dalam rupiah utuh: 25000, 25.000, 25rb, 1,5jt."
+    "Jumlah dalam rupiah utuh: 25000, 25.000, 25rb, 1,5jt, 2 juta."
 )
 START_MENU_HINT: Final = "\n\nKetik /bantuan untuk melihat perintah."
 WORKSPACE_LINE: Final = "{icon} <b>{name}</b>"
@@ -86,7 +86,11 @@ ASK_DESCRIPTION_EDIT: Final = "Kirim keterangan baru, atau tekan <b>Hapus ketera
 ASK_DATE: Final = (
     "Kirim tanggal: <code>hari ini</code>, <code>kemarin</code> atau <code>25/10/2026</code>."
 )
-ASK_CONFIRM: Final = "Periksa lalu tekan <b>Simpan</b>. Belum ada yang disimpan."
+ASK_CONFIRM: Final = (
+    "Periksa lalu tekan <b>Simpan</b>, atau <b>Ubah</b> untuk memperbaiki. Belum ada yang disimpan."
+)
+ASK_REVISE: Final = "Apa yang ingin diperbaiki sebelum disimpan?"
+ASK_CATEGORY_PAGE: Final = "Halaman {page}"
 ROUNDED_NOTE: Final = "Catatan: jumlah dibulatkan ke rupiah terdekat."
 FIELD_TYPE: Final = "Jenis"
 FIELD_AMOUNT: Final = "Jumlah"
@@ -97,6 +101,7 @@ FIELD_ACCOUNT: Final = "Akun"
 FIELD_STATUS: Final = "Status"
 NO_DESCRIPTION: Final = "—"
 EDIT_FIELD_LABEL: Final = {
+    "type": "Jenis",
     "amount": "Jumlah",
     "category": "Kategori",
     "description": "Keterangan",
@@ -105,7 +110,7 @@ EDIT_FIELD_LABEL: Final = {
 BUTTON_INCOME: Final = "⬆️ Pemasukan"
 BUTTON_EXPENSE: Final = "⬇️ Pengeluaran"
 BUTTON_SAVE: Final = "✅ Simpan"
-BUTTON_DATE: Final = "📅 Tanggal"
+BUTTON_BACK_TO_SUMMARY: Final = "↩️ Kembali ke ringkasan"
 BUTTON_CANCEL: Final = "❌ Batal"
 BUTTON_SKIP: Final = "Lewati"
 BUTTON_CLEAR_DESCRIPTION: Final = "Hapus keterangan"
@@ -123,6 +128,8 @@ BUTTON_ACTIVATE: Final = "✅ Aktifkan"
 BUTTON_CATEGORY_HISTORY: Final = "📜 Riwayat"
 BUTTON_NEW_INCOME_CATEGORY: Final = "+ Kategori pemasukan"
 BUTTON_NEW_EXPENSE_CATEGORY: Final = "+ Kategori pengeluaran"
+BUTTON_ARCHIVED_CATEGORIES: Final = "🗃️ Kategori nonaktif"
+BUTTON_ACTIVE_CATEGORIES: Final = "📂 Kategori aktif"
 
 SAVED: Final = "✅ Tersimpan: {type} {amount} — {category}, {date}."
 SAVED_AGAIN: Final = "Transaksi ini sudah disimpan sebelumnya: {type} {amount}, {date}."
@@ -139,6 +146,8 @@ DRAFT_EXPIRED: Final = (
     "Mulai lagi dengan /catat."
 )
 STALE_BUTTON: Final = "Tombol ini sudah tidak berlaku."
+BUSY: Final = "Sedang ada perubahan lain pada data yang sama. Tidak ada yang disimpan; coba lagi."
+MESSAGE_TOO_LONG: Final = "Daftar ini terlalu panjang untuk satu pesan. Persempit dengan filter."
 NOT_FOUND: Final = "Data tidak ditemukan."
 CONFLICT: Final = {
     "stale": "Transaksi ini sudah berubah. Buka lagi dari /riwayat untuk melihat versi terbaru.",
@@ -170,7 +179,9 @@ INVALID: Final = {
     "month_in_future": "Bulan itu belum berjalan.",
     "page": "Halaman tidak tersedia. Persempit dengan filter tanggal.",
     "no_changes": "Tidak ada perubahan.",
-    "account_unavailable": "Akun bawaan tidak tersedia. Hubungi pemilik ruang kerja.",
+    "account_unavailable": (
+        "Akun transaksi ini tidak tersedia lagi. Batalkan dengan /batal lalu catat ulang."
+    ),
     "txn_type": "Jenis transaksi harus pemasukan atau pengeluaran.",
     "filter_type": "Filter jenis harus pemasukan atau pengeluaran.",
 }
@@ -195,6 +206,9 @@ RESTORED: Final = "♻️ Transaksi dipulihkan."
 CHOOSE_EDIT_FIELD: Final = "Apa yang ingin diubah?"
 
 CATEGORIES_TITLE: Final = "<b>Kategori</b>"
+CATEGORIES_TITLE_ARCHIVED: Final = "<b>Kategori nonaktif</b>"
+CATEGORIES_EMPTY: Final = "Tidak ada kategori."
+CATEGORIES_PAGE: Final = "Halaman {page}"
 CATEGORIES_KIND: Final = "<b>{kind}</b>"
 CATEGORY_ITEM: Final = "• {name}{flags}"
 CATEGORY_FLAG_DEFAULT: Final = " (cadangan)"
@@ -210,7 +224,7 @@ CATEGORY_DEACTIVATED: Final = (
 )
 CATEGORY_ACTIVATED: Final = "Kategori <b>{name}</b> diaktifkan kembali."
 CATEGORY_USAGE: Final = (
-    "Gunakan: /kategori [pemasukan|pengeluaran], atau "
+    "Gunakan: /kategori [pemasukan|pengeluaran] [nonaktif], atau "
     "/kategori tambah pemasukan|pengeluaran &lt;nama&gt;"
 )
 

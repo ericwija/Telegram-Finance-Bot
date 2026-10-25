@@ -2,13 +2,25 @@
 
 ``FinanceStore.session()`` opens one database transaction for one user in one workspace:
 
-* it sets ``app.user_id``, loads the caller's **active** membership (and locks it ``FOR SHARE``
-  for writes, so a concurrent role change or removal waits for, and is serialized with, the
-  mutation), then sets ``app.workspace_id``; RLS applies to every query after that;
+* it sets ``app.user_id``, loads the user and the caller's **active** membership, then sets
+  ``app.workspace_id``; RLS applies to every query after that;
 * without an active membership there is no session: :class:`NotFoundError` (G-3);
 * every method also filters by the context workspace explicitly (rule 1), on top of RLS;
 * the transaction commits when the ``async with`` block exits normally, and rolls back on any
-  exception, so a refused or failed operation never leaves partial writes.
+  exception, so a refused or failed operation never leaves partial writes;
+* a deadlock or serialization failure rolls the whole transaction back and surfaces as
+  :class:`~finbot.domain.finance.RetryLaterError` (nothing was stored).
+
+:class:`SessionMode` decides isolation and locks (docs/10 §13.3 has the full lock order):
+
+* ``READ``: one ``REPEATABLE READ READ ONLY`` snapshot, so every figure of one report comes
+  from the same committed state; no row locks, no writes;
+* ``WRITE``: ``READ COMMITTED``; the user row, the membership and the workspace are locked
+  ``FOR SHARE``, so a concurrent suspension, role change, removal or status change waits for
+  (and is serialized with) the mutation that was authorized under the old state;
+* ``SEED``: as ``WRITE``, but the caller's membership is locked ``FOR NO KEY UPDATE`` from the
+  start, because seeding sets its default account. Taking the strongest lock first means a
+  lock is never upgraded, which is what deadlocked two concurrent first requests (Step 6B).
 
 Implemented by ``finbot.infra.db.finance``.
 """
@@ -16,7 +28,8 @@ Implemented by ``finbot.infra.db.finance``.
 from collections.abc import Mapping
 from contextlib import AbstractAsyncContextManager
 from datetime import date, datetime
-from typing import Any, Protocol
+from enum import StrEnum
+from typing import Any, Literal, Protocol
 from uuid import UUID
 
 from finbot.authz.context import WorkspaceContext
@@ -35,13 +48,25 @@ from finbot.domain.finance import (
 )
 from finbot.domain.ledger import EntrySpec, TxnSource, TxnType
 
+#: Row lock taken by a read inside a WRITE session: ``share`` to keep a row from changing
+#: until commit (an archive waits), ``update`` to change it.
+RowLock = Literal["share", "update"]
+
+
+class SessionMode(StrEnum):
+    READ = "read"
+    WRITE = "write"
+    SEED = "seed"
+
 
 class FinanceSession(Protocol):
     ctx: WorkspaceContext
 
     # ---------------------------------------------------------------- accounts
     async def list_accounts(self, *, include_archived: bool = False) -> list[Account]: ...
-    async def get_account(self, account_id: UUID) -> Account | None: ...
+    async def get_account(
+        self, account_id: UUID, *, lock: RowLock | None = None
+    ) -> Account | None: ...
     async def insert_account(
         self, name: str, account_type: str, opening_date: date
     ) -> Account | None:
@@ -51,12 +76,26 @@ class FinanceSession(Protocol):
     async def set_default_account(self, account_id: UUID) -> None: ...
 
     # -------------------------------------------------------------- categories
+    async def lock_category_names(self) -> None:
+        """Serialize category name changes and seeding in this workspace until commit, so a
+        duplicate name is found by a query and never reaches the unique index as an error
+        (whose detail would carry the name into the server log; docs/09 §10)."""
+        ...
+
     async def count_categories(self) -> int: ...
     async def list_categories(
-        self, kind: TxnType | None = None, *, include_archived: bool = False, limit: int = 100
-    ) -> list[Category]: ...
+        self,
+        kind: TxnType | None = None,
+        *,
+        archived: bool | None = False,
+        limit: int = 100,
+        offset: int = 0,
+    ) -> list[Category]:
+        """``archived``: False active only, True archived only, None both."""
+        ...
+
     async def get_category(
-        self, category_id: UUID, *, for_update: bool = False
+        self, category_id: UUID, *, lock: RowLock | None = None
     ) -> Category | None: ...
     async def find_active_category(self, kind: TxnType, name: str) -> Category | None: ...
     async def insert_category(
@@ -138,7 +177,10 @@ class FinanceSession(Protocol):
     ) -> None: ...
 
     # --------------------------------------------------------- pending actions
-    async def pending_action(self, *, for_update: bool = False) -> PendingAction | None: ...
+    async def pending_action(self, *, for_update: bool = False) -> PendingAction | None:
+        """The caller's pending action (its ``payload`` includes ``membership_version``)."""
+        ...
+
     async def cancel_pending_actions(self) -> int: ...
     async def insert_pending_action(
         self, kind: PendingKind, payload: Mapping[str, Any], expires_at: datetime
@@ -169,9 +211,15 @@ class FinanceSession(Protocol):
 
 class FinanceStore(Protocol):
     def session(
-        self, user_id: UUID, workspace_id: UUID | None = None, *, write: bool = False
+        self,
+        user_id: UUID,
+        workspace_id: UUID | None = None,
+        *,
+        mode: SessionMode = SessionMode.READ,
+        request_id: UUID | None = None,
     ) -> AbstractAsyncContextManager[FinanceSession]:
-        """One transaction as ``user_id`` in ``workspace_id`` (None: the personal workspace)."""
+        """One transaction as ``user_id`` in ``workspace_id`` (None: the personal workspace).
+        ``request_id`` correlates every audit event written in it (``audit_events.request_id``)."""
         ...
 
     async def record_denial(
@@ -183,6 +231,7 @@ class FinanceStore(Protocol):
         role: str | None,
         entity_type: str | None,
         channel: str,
+        request_id: UUID | None = None,
     ) -> None:
         """``security.authz_denied`` in its own short transaction (docs/09 §6.2)."""
         ...

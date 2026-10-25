@@ -1,9 +1,12 @@
 """PostgreSQL implementation of the finance unit of work (``ports.finance``), as ``finbot_app``.
 
 Every query uses bound parameters only and filters by the context workspace explicitly, on top
-of the RLS policies of revision 0004. Statements whose expected failure is a uniqueness
-conflict run in a savepoint, so the conflict is reported without aborting the request's
-transaction. Free text (descriptions, category names) never reaches logs or audit metadata.
+of the RLS policies of revision 0004. Isolation and locks follow :class:`SessionMode` (see
+``ports.finance``). Category names are checked for duplicates under a workspace lock before any
+write, so the unique indexes are a backstop that does not fire in normal operation; a backstop
+conflict runs in a savepoint and is reported without aborting the request's transaction. Free
+text (descriptions, category names) never reaches logs or audit metadata, and every audit event
+carries the request's correlation id.
 """
 
 import json
@@ -27,17 +30,26 @@ from finbot.domain.finance import (
     NotFoundError,
     PendingAction,
     PendingKind,
+    RetryLaterError,
     TransactionRecord,
 )
 from finbot.domain.identity import UserStatus
 from finbot.domain.ledger import EntrySpec, TxnSource, TxnStatus, TxnType
 from finbot.domain.money import Rupiah
+from finbot.ports.finance import RowLock, SessionMode
 
 if TYPE_CHECKING:
     from sqlalchemy.engine import Row
     from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine
 
 _UNIQUE_VIOLATION: Final = "23505"
+#: deadlock_detected, serialization_failure: the transaction was rolled back as a whole.
+_TRANSIENT: Final = frozenset({"40P01", "40001"})
+_LOCKS: Final[dict[RowLock | None, str]] = {
+    None: "",
+    "share": " FOR SHARE",
+    "update": " FOR UPDATE",
+}
 
 #: Columns ``update_transaction`` may set (column grants allow exactly these, plus version).
 _UPDATABLE: Final = frozenset(
@@ -125,10 +137,17 @@ def _draft(row: "Row[Any]") -> DraftRecord:
 
 
 class PgFinanceSession:
-    def __init__(self, conn: "AsyncConnection", ctx: WorkspaceContext, channel: str) -> None:
+    def __init__(
+        self,
+        conn: "AsyncConnection",
+        ctx: WorkspaceContext,
+        channel: str,
+        request_id: UUID | None = None,
+    ) -> None:
         self._conn = conn
         self.ctx = ctx
         self._channel = channel
+        self._request_id = request_id
 
     @property
     def _ids(self) -> dict[str, Any]:
@@ -168,11 +187,11 @@ class PgFinanceSession:
         )
         return [_account(r) for r in rows]
 
-    async def get_account(self, account_id: UUID) -> Account | None:
+    async def get_account(self, account_id: UUID, *, lock: RowLock | None = None) -> Account | None:
         row = await self._one(
-            "SELECT id, name, type, opening_balance, opening_date, "
+            "SELECT id, name, type, opening_balance, opening_date, "  # noqa: S608 - constants
             "(archived_at IS NOT NULL) AS archived FROM public.accounts "
-            "WHERE workspace_id = :ws AND id = :id",
+            f"WHERE workspace_id = :ws AND id = :id{_LOCKS[lock]}",
             {"id": account_id},
         )
         return None if row is None else _account(row)
@@ -198,6 +217,12 @@ class PgFinanceSession:
 
     # ----------------------------------------------------------------- categories
 
+    async def lock_category_names(self) -> None:
+        await self._exec(
+            "SELECT pg_catalog.pg_advisory_xact_lock(pg_catalog.hashtextextended(:key, 0))",
+            {"key": f"finbot.category-names:{self.ctx.workspace_id}"},
+        )
+
     async def count_categories(self) -> int:
         row = await self._one(
             "SELECT count(*) AS n FROM public.categories WHERE workspace_id = :ws"
@@ -205,23 +230,35 @@ class PgFinanceSession:
         return int(row.n)
 
     async def list_categories(
-        self, kind: TxnType | None = None, *, include_archived: bool = False, limit: int = 100
+        self,
+        kind: TxnType | None = None,
+        *,
+        archived: bool | None = False,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[Category]:
         rows = await self._rows(
             f"SELECT {_CATEGORY_COLUMNS} FROM public.categories "  # noqa: S608 - constant
             "WHERE workspace_id = :ws AND (CAST(:kind AS text) IS NULL OR kind = :kind) "
-            "AND (:all OR archived_at IS NULL) "
+            "AND (CAST(:archived AS boolean) IS NULL "
+            "OR (archived_at IS NOT NULL) = CAST(:archived AS boolean)) "
             "ORDER BY (kind = 'expense'), (archived_at IS NOT NULL), is_default, "
-            "pg_catalog.lower(name), id LIMIT :limit",
-            {"kind": kind.value if kind else None, "all": include_archived, "limit": limit},
+            "pg_catalog.lower(name), id LIMIT :limit OFFSET :offset",
+            {
+                "kind": kind.value if kind else None,
+                "archived": archived,
+                "limit": limit,
+                "offset": offset,
+            },
         )
         return [_category(r) for r in rows]
 
-    async def get_category(self, category_id: UUID, *, for_update: bool = False) -> Category | None:
-        lock = " FOR UPDATE" if for_update else ""
+    async def get_category(
+        self, category_id: UUID, *, lock: RowLock | None = None
+    ) -> Category | None:
         row = await self._one(
             f"SELECT {_CATEGORY_COLUMNS} FROM public.categories "  # noqa: S608 - constants
-            f"WHERE workspace_id = :ws AND id = :id{lock}",
+            f"WHERE workspace_id = :ws AND id = :id{_LOCKS[lock]}",
             {"id": category_id},
         )
         return None if row is None else _category(row)
@@ -582,9 +619,10 @@ class PgFinanceSession:
     ) -> None:
         await self._exec(
             "INSERT INTO public.audit_events (workspace_id, actor_user_id, actor_kind, channel, "
-            "action, entity_type, entity_id, metadata) VALUES (:ws, :actor, :kind, :channel, "
-            ":action, :entity_type, :entity_id, CAST(:metadata AS jsonb))",
+            "action, entity_type, entity_id, request_id, metadata) VALUES (:ws, :actor, :kind, "
+            ":channel, :action, :entity_type, :entity_id, :request_id, CAST(:metadata AS jsonb))",
             {
+                "request_id": self._request_id,
                 "actor": None if actor_kind == "system" else self.ctx.user_id,
                 "kind": actor_kind,
                 "channel": self._channel,
@@ -602,20 +640,60 @@ async def _set(conn: "AsyncConnection", name: str, value: UUID) -> None:
     )
 
 
+_MEMBERSHIP_SQL: Final = (
+    "SELECT m.role, m.default_account_id, m.version, w.kind, w.name, w.status, w.timezone, "
+    "w.currency FROM public.workspace_memberships m "
+    "JOIN public.workspaces w ON w.id = m.workspace_id "
+    "WHERE m.workspace_id = :ws AND m.user_id = :user AND m.status = 'active'"
+)
+#: Lock clauses per mode, always in the same order: user row, then membership and workspace
+#: (docs/10 §13.3). SEED takes the membership lock it will need to set the default account.
+_SESSION_LOCKS: Final = {
+    SessionMode.READ: ("", ""),
+    SessionMode.WRITE: (" FOR SHARE", " FOR SHARE OF m, w"),
+    SessionMode.SEED: (" FOR SHARE", " FOR NO KEY UPDATE OF m FOR SHARE OF w"),
+}
+
+
 class PgFinanceStore:
     def __init__(self, engine: "AsyncEngine", *, channel: str = "telegram") -> None:
         self._engine = engine
         self._channel = channel
 
     @asynccontextmanager
+    async def _transaction(self, mode: SessionMode) -> AsyncIterator["AsyncConnection"]:
+        """One transaction; a deadlock or serialization failure becomes RetryLaterError."""
+        from sqlalchemy.exc import DBAPIError  # noqa: PLC0415
+
+        try:
+            async with self._engine.connect() as conn:
+                if mode is SessionMode.READ:  # one snapshot for the whole request (reports)
+                    await conn.execution_options(
+                        isolation_level="REPEATABLE READ", postgresql_readonly=True
+                    )
+                async with conn.begin():
+                    yield conn
+        except DBAPIError as exc:
+            if _sqlstate(exc) in _TRANSIENT:
+                raise RetryLaterError("transient") from None
+            raise
+
+    @asynccontextmanager
     async def session(
-        self, user_id: UUID, workspace_id: UUID | None = None, *, write: bool = False
+        self,
+        user_id: UUID,
+        workspace_id: UUID | None = None,
+        *,
+        mode: SessionMode = SessionMode.READ,
+        request_id: UUID | None = None,
     ) -> AsyncIterator[PgFinanceSession]:
-        async with self._engine.begin() as conn:
+        user_lock, member_lock = _SESSION_LOCKS[mode]
+        async with self._transaction(mode) as conn:
             await _set(conn, "app.user_id", user_id)
             user = (
                 await conn.execute(
-                    _text("SELECT status FROM public.users WHERE id = :user"), {"user": user_id}
+                    _text(f"SELECT status FROM public.users WHERE id = :user{user_lock}"),  # noqa: S608
+                    {"user": user_id},
                 )
             ).one_or_none()
             if user is None:
@@ -632,17 +710,9 @@ class PgFinanceStore:
                 ).scalar_one_or_none()
                 if workspace_id is None:
                     raise NotFoundError("workspace")
-            lock = " FOR SHARE OF m" if write else ""
             row = (
                 await conn.execute(
-                    _text(
-                        "SELECT m.role, m.default_account_id, w.kind, w.name, w.status, "  # noqa: S608
-                        "w.timezone, w.currency FROM public.workspace_memberships m "
-                        "JOIN public.workspaces w ON w.id = m.workspace_id "
-                        "WHERE m.workspace_id = :ws AND m.user_id = :user "
-                        f"AND m.status = 'active'{lock}"
-                    ),
-                    {"ws": workspace_id, "user": user_id},
+                    _text(_MEMBERSHIP_SQL + member_lock), {"ws": workspace_id, "user": user_id}
                 )
             ).one_or_none()
             if row is None:
@@ -659,8 +729,9 @@ class PgFinanceStore:
                 currency=row.currency,
                 role=row.role,
                 default_account_id=row.default_account_id,
+                membership_version=row.version,
             )
-            yield PgFinanceSession(conn, ctx, self._channel)
+            yield PgFinanceSession(conn, ctx, self._channel, request_id)
 
     async def record_denial(
         self,
@@ -671,22 +742,24 @@ class PgFinanceStore:
         role: str | None,
         entity_type: str | None,
         channel: str,
+        request_id: UUID | None = None,
     ) -> None:
-        async with self._engine.begin() as conn:
+        async with self._transaction(SessionMode.WRITE) as conn:
             await _set(conn, "app.user_id", user_id)
             await _set(conn, "app.workspace_id", workspace_id)
             await conn.execute(
                 _text(
                     "INSERT INTO public.audit_events (workspace_id, actor_user_id, actor_kind, "
-                    "channel, action, entity_type, outcome, metadata) VALUES (:ws, :user, "
-                    "'user', :channel, 'security.authz_denied', :entity_type, 'denied', "
-                    "CAST(:metadata AS jsonb))"
+                    "channel, action, entity_type, request_id, outcome, metadata) VALUES (:ws, "
+                    ":user, 'user', :channel, 'security.authz_denied', :entity_type, :request_id, "
+                    "'denied', CAST(:metadata AS jsonb))"
                 ),
                 {
                     "ws": workspace_id,
                     "user": user_id,
                     "channel": channel,
                     "entity_type": entity_type,
+                    "request_id": request_id,
                     "metadata": json.dumps({"permission": permission, "role": role}),
                 },
             )

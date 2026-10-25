@@ -1,10 +1,12 @@
 """An in-memory ``FinanceStore`` for fast service and adapter unit tests (no database).
 
 It implements the port's semantics that the services rely on: one session per transaction with
-rollback on exception (a deep copy restored), the active-membership check, per-workspace
-filtering, per-user drafts, unique active names, optimistic versions and append-only rows. It
-does **not** replace the database tests: RLS, grants, triggers and isolation are proven only
-against real PostgreSQL (``tests/integration``), as CLAUDE.md requires for tenant data.
+rollback on exception (a deep copy restored), the active-membership check, the membership
+version, per-workspace filtering, per-user drafts, unique active names, optimistic versions and
+append-only rows. Locks are no-ops (a single event loop interleaves nothing inside a session),
+so it does **not** replace the database tests: RLS, grants, triggers, locking, isolation levels
+and concurrency are proven only against real PostgreSQL (``tests/integration``), as CLAUDE.md
+requires for tenant data. ``sessions`` records the mode of every session opened.
 """
 
 import copy
@@ -34,6 +36,7 @@ from finbot.domain.finance import (
 from finbot.domain.identity import UserStatus
 from finbot.domain.ledger import EntrySpec, TxnSource, TxnStatus, TxnType
 from finbot.domain.money import Rupiah
+from finbot.ports.finance import RowLock, SessionMode
 
 
 @dataclass
@@ -44,7 +47,17 @@ class Workspace:
     status: str = "active"
     timezone: str = "Asia/Jakarta"
     currency: str = "IDR"
-    members: dict[uuid.UUID, dict[str, Any]] = field(default_factory=dict)  # role, default
+    #: user -> {"role", "default", "status", "version"}
+    members: dict[uuid.UUID, dict[str, Any]] = field(default_factory=dict)
+
+    def set_member(
+        self, user: uuid.UUID, *, role: str | None = None, status: str | None = None
+    ) -> None:
+        """A role or status change; bumps the version like trg_membership_version (0005)."""
+        member = self.members[user]
+        member["role"] = role or member["role"]
+        member["status"] = status or member["status"]
+        member["version"] += 1
 
 
 @dataclass
@@ -67,10 +80,15 @@ def _new_id(state: State) -> uuid.UUID:
     return uuid.UUID(int=(state.seq << 64) | uuid.uuid4().int >> 64)
 
 
+def _member(role: str) -> dict[str, Any]:
+    return {"role": role, "default": None, "status": "active", "version": 1}
+
+
 class FakeSession:
-    def __init__(self, state: State, ctx: WorkspaceContext) -> None:
+    def __init__(self, state: State, ctx: WorkspaceContext, request_id: uuid.UUID | None) -> None:
         self.st = state
         self.ctx = ctx
+        self.request_id = request_id
 
     @property
     def _ws(self) -> uuid.UUID:
@@ -90,7 +108,9 @@ class FakeSession:
             a["id"], a["name"], a["type"], a["opening"], a["opening_date"], a["archived"]
         )
 
-    async def get_account(self, account_id: uuid.UUID) -> Account | None:
+    async def get_account(
+        self, account_id: uuid.UUID, *, lock: RowLock | None = None
+    ) -> Account | None:
         a = self.st.accounts.get(account_id)
         return self._account(a) if a and a["workspace_id"] == self._ws else None
 
@@ -133,16 +153,25 @@ class FakeSession:
             None,
         )
 
+    async def lock_category_names(self) -> None:
+        return None
+
     async def count_categories(self) -> int:
         return len(self._mine(self.st.categories))
 
     async def list_categories(
-        self, kind: TxnType | None = None, *, include_archived: bool = False, limit: int = 100
+        self,
+        kind: TxnType | None = None,
+        *,
+        archived: bool | None = False,
+        limit: int = 100,
+        offset: int = 0,
     ) -> list[Category]:
         rows = [
             c
             for c in self._mine(self.st.categories)
-            if (kind is None or c["kind"] is kind) and (include_archived or not c["archived"])
+            if (kind is None or c["kind"] is kind)
+            and (archived is None or c["archived"] is archived)
         ]
         rows.sort(
             key=lambda c: (
@@ -152,10 +181,10 @@ class FakeSession:
                 c["name"].lower(),
             )
         )
-        return [self._category(c) for c in rows[:limit]]
+        return [self._category(c) for c in rows[offset : offset + limit]]
 
     async def get_category(
-        self, category_id: uuid.UUID, *, for_update: bool = False
+        self, category_id: uuid.UUID, *, lock: RowLock | None = None
     ) -> Category | None:
         c = self.st.categories.get(category_id)
         return self._category(c) if c and c["workspace_id"] == self._ws else None
@@ -497,6 +526,8 @@ class FakeSession:
     ) -> None:
         self.st.audit.append(
             {
+                "request_id": self.request_id,
+                "entity_type": entity_type,
                 "workspace_id": self._ws,
                 "action": action,
                 "entity_id": entity_id,
@@ -510,12 +541,13 @@ class FakeFinanceStore:
     def __init__(self) -> None:
         self.state = State()
         self.denials: list[dict[str, Any]] = []
+        self.sessions: list[SessionMode] = []
 
     def add_person(self) -> tuple[uuid.UUID, uuid.UUID]:
         user, ws = uuid.uuid4(), uuid.uuid4()
         self.state.users[user] = UserStatus.ACTIVE
         self.state.workspaces[ws] = Workspace(
-            ws, "personal", "Pribadi", members={user: {"role": "owner", "default": None}}
+            ws, "personal", "Pribadi", members={user: _member("owner")}
         )
         return user, ws
 
@@ -525,14 +557,20 @@ class FakeFinanceStore:
             ws,
             "business",
             "Toko",
-            members={u: {"role": r, "default": None} for u, r in members.items()},
+            members={u: _member(r) for u, r in members.items()},
         )
         return ws
 
     @asynccontextmanager
     async def session(
-        self, user_id: uuid.UUID, workspace_id: uuid.UUID | None = None, *, write: bool = False
+        self,
+        user_id: uuid.UUID,
+        workspace_id: uuid.UUID | None = None,
+        *,
+        mode: SessionMode = SessionMode.READ,
+        request_id: uuid.UUID | None = None,
     ) -> AsyncIterator[FakeSession]:
+        self.sessions.append(mode)
         backup = copy.deepcopy(self.state)
         try:
             if user_id not in self.state.users:
@@ -547,7 +585,7 @@ class FakeFinanceStore:
                     None,
                 )
             ws = self.state.workspaces.get(workspace_id) if workspace_id else None
-            if ws is None or user_id not in ws.members:
+            if ws is None or ws.members.get(user_id, {}).get("status") != "active":
                 raise NotFoundError("workspace")
             member = ws.members[user_id]
             ctx = WorkspaceContext(
@@ -561,8 +599,12 @@ class FakeFinanceStore:
                 ws.currency,
                 member["role"],
                 member["default"],
+                member["version"],
             )
-            yield FakeSession(self.state, ctx)
+            session = FakeSession(self.state, ctx, request_id)
+            yield session
+            if mode is SessionMode.READ and self.state.__dict__ != backup.__dict__:
+                raise AssertionError("a READ session wrote")  # PostgreSQL: READ ONLY
         except BaseException:
             self.state.__dict__.update(backup.__dict__)  # rollback
             raise
@@ -576,5 +618,14 @@ class FakeFinanceStore:
         role: str | None,
         entity_type: str | None,
         channel: str,
+        request_id: uuid.UUID | None = None,
     ) -> None:
-        self.denials.append({"user": user_id, "workspace": workspace_id, "permission": permission})
+        self.denials.append(
+            {
+                "user": user_id,
+                "workspace": workspace_id,
+                "permission": permission,
+                "entity_type": entity_type,
+                "request_id": request_id,
+            }
+        )

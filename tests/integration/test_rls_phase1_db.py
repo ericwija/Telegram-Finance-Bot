@@ -526,6 +526,9 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "ledger_entries_balanced",
         "ledger_entry_active_account",
         "ledger_txn_active_category",
+        # 0005: the schema revision for the start-up guard (G-ENV-7), without any privilege
+        # on alembic_version itself.
+        "app_schema_revision",
     }
     for f in functions:
         assert f.owner == "finbot_owner"
@@ -545,6 +548,7 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "ledger_entries_balanced": set(),
         "ledger_entry_active_account": set(),
         "ledger_txn_active_category": set(),
+        "app_schema_revision": {"finbot_app"},
     }
 
 

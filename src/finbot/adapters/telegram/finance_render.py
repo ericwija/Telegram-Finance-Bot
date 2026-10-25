@@ -3,11 +3,15 @@
 Pure functions: they return the message text and keyboard rows of ``(label, callback_data)``.
 Every user- or database-supplied string (workspace and category names, descriptions) goes
 through :func:`html.escape`; amounts go through ``format_rupiah``. Every confirmation names
-the workspace and its type (G-8). Messages stay well under Telegram's 4,096 characters: lists
-are paged (history) or capped (category breakdowns).
+the workspace and its type (G-8) and the account. Messages stay under Telegram's limits by
+construction: lists are paged (history, categories: every category is reachable) or capped
+(report breakdowns), names are at most 40 characters, and a keyboard never exceeds 100
+buttons. :func:`fits_telegram` measures a message the way Telegram does (characters after
+entity parsing, in UTF-16 code units) for the sender's last-resort check.
 """
 
 import html
+import re
 from datetime import date, datetime
 from typing import Final
 from zoneinfo import ZoneInfo
@@ -20,6 +24,7 @@ from finbot.domain.finance import (
     CaptureStep,
     Category,
     CategoryTotal,
+    DraftField,
     DraftPurpose,
     DraftView,
     EditField,
@@ -44,9 +49,11 @@ Keyboard = list[list[Button]]
 Reply = tuple[str, Keyboard]
 
 SUMMARY_CATEGORY_LIMIT: Final = 15
-#: Telegram allows at most 100 inline buttons per message; keep room for navigation rows.
-CATEGORY_BUTTON_LIMIT: Final = 90
+#: Telegram Bot API limits: message text after entity parsing; inline buttons per message.
+TELEGRAM_TEXT_LIMIT: Final = 4096
+TELEGRAM_BUTTON_LIMIT: Final = 100
 DESCRIPTION_PREVIEW: Final = 40
+_TAG_RE = re.compile(r"<[^>]*>")
 MONTH_LABELS: Final = (
     "Januari", "Februari", "Maret", "April", "Mei", "Juni",
     "Juli", "Agustus", "September", "Oktober", "November", "Desember",
@@ -55,6 +62,17 @@ MONTH_LABELS: Final = (
 
 def esc(value: str) -> str:
     return html.escape(value, quote=False)
+
+
+def telegram_length(text: str) -> int:
+    """Length as Telegram counts it: tags removed, entities decoded, UTF-16 code units."""
+    visible = html.unescape(_TAG_RE.sub("", text))
+    return len(visible.encode("utf-16-le")) // 2
+
+
+def fits_telegram(text: str, keyboard: "Keyboard") -> bool:
+    buttons = sum(len(row) for row in keyboard)
+    return 0 < telegram_length(text) <= TELEGRAM_TEXT_LIMIT and buttons <= TELEGRAM_BUTTON_LIMIT
 
 
 def fmt_date(value: date) -> str:
@@ -103,19 +121,37 @@ def _capture_lines(view: DraftView, state: CaptureState) -> list[str]:
     if state.description_done:
         lines.append(f"{msg.FIELD_DESCRIPTION}: {esc(state.description or msg.NO_DESCRIPTION)}")
     lines.append(f"{msg.FIELD_DATE}: {fmt_date(state.txn_date)}")
+    if view.account is not None:
+        lines.append(f"{msg.FIELD_ACCOUNT}: {esc(view.account.name)}")
     if state.rounded:
         lines.append(msg.ROUNDED_NOTE)
     return lines
 
 
 def _category_buttons(view: DraftView) -> Keyboard:
-    categories = view.categories[:CATEGORY_BUTTON_LIMIT]
-    return _rows([(c.name, cb.draft_category(view.ref, c.id)) for c in categories])
+    keyboard = _rows([(c.name, cb.draft_category(view.ref, c.id)) for c in view.categories])
+    nav: list[Button] = []
+    if view.category_page > 0:
+        nav.append((msg.BUTTON_PREV, cb.draft_category_page(view.ref, view.category_page - 1)))
+    if view.categories_has_next:
+        nav.append((msg.BUTTON_NEXT, cb.draft_category_page(view.ref, view.category_page + 1)))
+    return [*keyboard, nav] if nav else keyboard
+
+
+def _category_step_text(view: DraftView) -> str:
+    if not view.categories:
+        return msg.ASK_CATEGORY_EMPTY
+    if view.category_page > 0 or view.categories_has_next:
+        page = msg.ASK_CATEGORY_PAGE.format(page=view.category_page + 1)
+        return f"{msg.ASK_CATEGORY} ({page})"
+    return msg.ASK_CATEGORY
 
 
 def _render_capture(view: DraftView, state: CaptureState) -> Reply:
     lines = _capture_lines(view, state)
     cancel = [(msg.BUTTON_CANCEL, cb.draft_cancel(view.ref))]
+    if state.revising:  # a correction can be left unchanged
+        cancel = [(msg.BUTTON_BACK_TO_SUMMARY, cb.draft_back(view.ref)), *cancel]
     match state.step:
         case CaptureStep.TYPE:
             lines.append("\n" + msg.ASK_TYPE)
@@ -130,7 +166,7 @@ def _render_capture(view: DraftView, state: CaptureState) -> Reply:
             lines.append("\n" + msg.ASK_AMOUNT)
             keyboard = [cancel]
         case CaptureStep.CATEGORY:
-            lines.append("\n" + (msg.ASK_CATEGORY if view.categories else msg.ASK_CATEGORY_EMPTY))
+            lines.append("\n" + _category_step_text(view))
             keyboard = [*_category_buttons(view), cancel]
         case CaptureStep.DESCRIPTION:
             lines.append("\n" + msg.ASK_DESCRIPTION)
@@ -143,11 +179,35 @@ def _render_capture(view: DraftView, state: CaptureState) -> Reply:
             keyboard = [
                 [
                     (msg.BUTTON_SAVE, cb.draft_confirm(view.ref)),
-                    (msg.BUTTON_DATE, cb.draft_date(view.ref)),
+                    (msg.BUTTON_EDIT, cb.draft_review(view.ref)),
                 ],
                 cancel,
             ]
     return "\n".join(lines), keyboard
+
+
+#: The fields offered by ✏️ Ubah on a confirmation, in the order of the summary.
+REVISE_FIELDS: Final = (
+    DraftField.TYPE,
+    DraftField.AMOUNT,
+    DraftField.CATEGORY,
+    DraftField.DESCRIPTION,
+    DraftField.DATE,
+)
+
+
+def render_draft_review(view: DraftView) -> Reply:
+    """The complete confirmation with one button per correctable field (FR-TXN-05)."""
+    if not isinstance(view.state, CaptureState):  # pragma: no cover - the service refuses
+        return render_draft(view)
+    lines = _capture_lines(view, view.state)
+    lines.append("\n" + msg.ASK_REVISE)
+    buttons = [(msg.EDIT_FIELD_LABEL[f.value], cb.draft_revise(view.ref, f)) for f in REVISE_FIELDS]
+    return "\n".join(lines), [
+        *_rows(buttons, per_row=3),
+        [(msg.BUTTON_BACK_TO_SUMMARY, cb.draft_back(view.ref))],
+        [(msg.BUTTON_CANCEL, cb.draft_cancel(view.ref))],
+    ]
 
 
 def _render_edit(view: DraftView, state: EditState) -> Reply:
@@ -168,7 +228,7 @@ def _render_edit(view: DraftView, state: EditState) -> Reply:
             lines.append("\n" + msg.ASK_AMOUNT)
             keyboard = [cancel]
         case CaptureStep.CATEGORY:
-            lines.append("\n" + (msg.ASK_CATEGORY if view.categories else msg.ASK_CATEGORY_EMPTY))
+            lines.append("\n" + _category_step_text(view))
             keyboard = [*_category_buttons(view), cancel]
         case CaptureStep.DESCRIPTION:
             lines.append("\n" + msg.ASK_DESCRIPTION_EDIT)
@@ -326,21 +386,46 @@ def _kind_label(kind: TxnType) -> str:
     return msg.TYPE_LABEL[kind.value]
 
 
-def render_categories(listing: CategoryListing, kind: TxnType | None) -> Reply:
-    lines = [msg.CATEGORIES_TITLE, _ws(listing.workspace)]
+def render_categories(listing: CategoryListing) -> Reply:
+    """One page of categories; every category is reachable through the page buttons."""
+    title = msg.CATEGORIES_TITLE_ARCHIVED if listing.archived else msg.CATEGORIES_TITLE
+    lines = [title, _ws(listing.workspace)]
     buttons: list[Button] = []
     for current in (TxnType.INCOME, TxnType.EXPENSE):
-        if kind is not None and current is not kind:
-            continue
         items = [c for c in listing.categories if c.kind is current]
+        if not items:
+            continue
         lines.append("\n" + msg.CATEGORIES_KIND.format(kind=_kind_label(current)))
         for category in items:
             flags = msg.CATEGORY_FLAG_DEFAULT if category.is_default else ""
             flags += msg.CATEGORY_FLAG_ARCHIVED if category.archived else ""
             lines.append(msg.CATEGORY_ITEM.format(name=esc(category.name), flags=flags))
             buttons.append((category.name, cb.category_detail(category.id)))
-    keyboard = _rows(buttons[:CATEGORY_BUTTON_LIMIT], per_row=3)
-    if listing.can_manage:
+    if not listing.categories:
+        lines.append("\n" + msg.CATEGORIES_EMPTY)
+    if listing.page > 0 or listing.has_next:
+        lines.append("\n" + msg.CATEGORIES_PAGE.format(page=listing.page + 1))
+    keyboard = _rows(buttons, per_row=3)
+    nav: list[Button] = []
+    if listing.page > 0:
+        nav.append(
+            (msg.BUTTON_PREV, cb.category_list(listing.kind, listing.page - 1,
+                                               archived=listing.archived))
+        )  # fmt: skip
+    if listing.has_next:
+        nav.append(
+            (msg.BUTTON_NEXT, cb.category_list(listing.kind, listing.page + 1,
+                                               archived=listing.archived))
+        )  # fmt: skip
+    if nav:
+        keyboard.append(nav)
+    toggle = (
+        (msg.BUTTON_ACTIVE_CATEGORIES, cb.category_list(listing.kind))
+        if listing.archived
+        else (msg.BUTTON_ARCHIVED_CATEGORIES, cb.category_list(listing.kind, archived=True))
+    )
+    keyboard.append([toggle])
+    if listing.can_manage and not listing.archived:
         keyboard.append(
             [
                 (msg.BUTTON_NEW_INCOME_CATEGORY, cb.category_new(TxnType.INCOME)),
@@ -365,7 +450,8 @@ def render_category(category: Category, can_manage: bool) -> Reply:
             buttons.append((msg.BUTTON_ACTIVATE, cb.category_active(category.id, True)))
         elif not category.is_default:
             buttons.append((msg.BUTTON_DEACTIVATE, cb.category_active(category.id, False)))
-    return text, [*_rows(buttons), [(msg.BUTTON_BACK, cb.category_list(category.kind))]]
+    back = cb.category_list(category.kind, archived=category.archived)
+    return text, [*_rows(buttons), [(msg.BUTTON_BACK, back)]]
 
 
 def render_category_prompt(prompt: CategoryPrompt) -> Reply:
@@ -374,7 +460,8 @@ def render_category_prompt(prompt: CategoryPrompt) -> Reply:
     else:
         kind = TxnType(prompt.action.payload["kind"])
         text = msg.CATEGORY_ASK_NEW.format(kind=_kind_label(kind).lower())
-    return f"{_ws(prompt.workspace)}\n{text}", []
+    # Its own reference: this ❌ cancels this prompt only, never a later conversation (F08).
+    return f"{_ws(prompt.workspace)}\n{text}", [[(msg.BUTTON_CANCEL, cb.draft_cancel(prompt.ref))]]
 
 
 # ---------------------------------------------------------------------------- reports

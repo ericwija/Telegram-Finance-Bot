@@ -12,12 +12,15 @@ Each update is handled in three steps, with no business logic here:
 
 Button presses edit the message they came from, so a confirmed or cancelled draft loses its
 buttons. Callback data is decoded strictly (``finance_callbacks``); anything malformed is
-answered as a stale button.
+answered as a stale button. Every update gets a fresh request id that correlates its log
+lines and audit events. A reply that would exceed Telegram's limits is never sent: it is
+replaced by a short explanation (``fits_telegram``).
 """
 
 import logging
+import uuid
 from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date
 from typing import Any, Final
 
@@ -53,11 +56,13 @@ from finbot.domain.finance import (
     InvalidInputError,
     NotFoundError,
     PendingKind,
+    RetryLaterError,
     StepError,
     parse_date,
     parse_month,
 )
 from finbot.domain.ledger import TxnType
+from finbot.domain.money import split_leading_amount
 from finbot.services.capture import CaptureService, CategoryDone
 from finbot.services.finance import Actor
 from finbot.services.ledger import LedgerService, TransactionDetail
@@ -73,6 +78,7 @@ _NO_PREVIEW: Final = LinkPreviewOptions(is_disabled=True)
 _TYPE_WORDS: Final = {"pemasukan": TxnType.INCOME, "pengeluaran": TxnType.EXPENSE}
 _VOIDED_WORD: Final = "dihapus"
 _NEW_WORD: Final = "tambah"
+_ARCHIVED_WORD: Final = "nonaktif"
 _CATEGORY_NAME_MAX_ARGS: Final = 200
 
 Reply = render.Reply
@@ -103,14 +109,9 @@ def command_args(text: str | None) -> str:
 
 
 def split_amount(args: str) -> tuple[str | None, str | None]:
-    """``25rb makan siang`` → (``25rb``, ``makan siang``); ``Rp 25.000 x`` keeps ``Rp``."""
-    tokens = args.split()
-    if not tokens:
-        return None, None
-    take = 2 if tokens[0].lower().rstrip(".") == "rp" and len(tokens) > 1 else 1
-    amount = " ".join(tokens[:take])
-    description = " ".join(tokens[take:]) or None
-    return amount, description
+    """``2 juta makan siang`` → (``2 juta``, ``makan siang``), with the amount grammar of
+    ``domain.money`` (separated units, ``Rp`` prefix, Indonesian separators)."""
+    return split_leading_amount(args)
 
 
 def history_filter(args: str, today: date) -> HistoryFilter:
@@ -156,6 +157,7 @@ _FIXED_MESSAGES: Final[dict[type[Exception], str]] = {
     NotFoundError: msg.NOT_FOUND,
     DraftExpiredError: msg.DRAFT_EXPIRED,
     StepError: msg.USE_BUTTONS,
+    RetryLaterError: msg.BUSY,
     cb.InvalidCallbackError: msg.STALE_BUTTON,
 }
 
@@ -184,6 +186,7 @@ _EXPECTED: Final = (
     DuplicateNameError,
     InvalidInputError,
     StepError,
+    RetryLaterError,
     cb.InvalidCallbackError,
 )
 
@@ -191,6 +194,9 @@ _EXPECTED: Final = (
 async def _send(update: Update, text: str, keyboard: render.Keyboard) -> None:
     """Edit the message a button came from; otherwise reply. Telegram errors: type only."""
     query = update.callback_query
+    if not render.fits_telegram(text, keyboard):
+        logger.warning("reply too large for Telegram", extra={"event": "telegram.reply_too_large"})
+        text, keyboard = msg.MESSAGE_TOO_LONG, []
     markup = _markup(keyboard)
     try:
         if query is not None and isinstance(query.message, Message):
@@ -236,13 +242,18 @@ class FinanceHandlers:
         user = update.effective_user
         if user is None:
             return
+        request_id = uuid.uuid4()
         try:
-            actor = await self.s.principals.actor(user.id)
+            actor = replace(await self.s.principals.actor(user.id), request_id=request_id)
             text, keyboard = await operation(actor)
         except _EXPECTED as exc:
             logger.info(
                 "finance request refused",
-                extra={"event": "finance.refused", "error_type": type(exc).__name__},
+                extra={
+                    "event": "finance.refused",
+                    "error_type": type(exc).__name__,
+                    "request_id": request_id,
+                },
             )
             text, keyboard = error_text(exc) or msg.GENERIC_ERROR, []
         await _send(update, text, keyboard)
@@ -316,6 +327,8 @@ class FinanceHandlers:
         await self._run(update, op)
 
     async def categories(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """``/kategori [pemasukan|pengeluaran] [nonaktif]`` or ``/kategori tambah <jenis>
+        <nama>``. ``nonaktif`` lists the deactivated categories, to reactivate them (F07)."""
         args = command_args(_text(update))
         first, _, rest = args.partition(" ")
 
@@ -327,10 +340,18 @@ class FinanceHandlers:
                     return msg.CATEGORY_USAGE, []
                 category = await self.s.ledger.create_category(actor, kind, name)
                 return _created_text(category), []
-            if first and first.lower() not in _TYPE_WORDS:
+            words = args.lower().split()
+            archived = _ARCHIVED_WORD in words
+            kinds = [_TYPE_WORDS[w] for w in words if w in _TYPE_WORDS]
+            if (
+                len(words) != len(kinds) + archived
+                or len(kinds) > 1
+                or words.count(_ARCHIVED_WORD) > 1
+            ):
                 return msg.CATEGORY_USAGE, []
-            kind = _TYPE_WORDS.get(first.lower()) if first else None
-            return render.render_categories(await self.s.ledger.categories(actor, kind), kind)
+            kind = kinds[0] if kinds else None
+            listing = await self.s.ledger.categories(actor, kind, archived=archived)
+            return render.render_categories(listing)
 
         await self._run(update, op)
 
@@ -383,11 +404,22 @@ class FinanceHandlers:
             await self.s.capture.choose_category(actor, _ref(data), _need(data.entity_id))
         )
 
+    async def _b_category_page(self, actor: Actor, data: cb.Callback) -> Reply:
+        return render.render_draft(await self.s.capture.category_page(actor, _ref(data), data.page))
+
     async def _b_skip(self, actor: Actor, data: cb.Callback) -> Reply:
         return render.render_draft(await self.s.capture.skip_description(actor, _ref(data)))
 
-    async def _b_date(self, actor: Actor, data: cb.Callback) -> Reply:
-        return render.render_draft(await self.s.capture.ask_date(actor, _ref(data)))
+    async def _b_review(self, actor: Actor, data: cb.Callback) -> Reply:
+        return render.render_draft_review(await self.s.capture.review(actor, _ref(data)))
+
+    async def _b_revise(self, actor: Actor, data: cb.Callback) -> Reply:
+        return render.render_draft(
+            await self.s.capture.revise(actor, _ref(data), _need(data.draft_field))
+        )
+
+    async def _b_back(self, actor: Actor, data: cb.Callback) -> Reply:
+        return render.render_draft(await self.s.capture.back(actor, _ref(data)))
 
     async def _b_confirm(self, actor: Actor, data: cb.Callback) -> Reply:
         return render.render_confirmed(await self.s.capture.confirm(actor, _ref(data)))
@@ -437,8 +469,10 @@ class FinanceHandlers:
     # Categories.
 
     async def _b_category_list(self, actor: Actor, data: cb.Callback) -> Reply:
-        listing = await self.s.ledger.categories(actor, data.txn_type)
-        return render.render_categories(listing, data.txn_type)
+        listing = await self.s.ledger.categories(
+            actor, data.txn_type, archived=data.flag, page=data.page
+        )
+        return render.render_categories(listing)
 
     async def _b_category_detail(self, actor: Actor, data: cb.Callback) -> Reply:
         return render.render_category(*await self.s.ledger.category(actor, _need(data.entity_id)))
@@ -461,8 +495,11 @@ class FinanceHandlers:
     ] = {
         "ty": _b_type,
         "ca": _b_category,
+        "cp": _b_category_page,
         "sk": _b_skip,
-        "dt": _b_date,
+        "ub": _b_review,
+        "uf": _b_revise,
+        "rv": _b_back,
         "ok": _b_confirm,
         "no": _b_cancel,
         "h": _b_history,
