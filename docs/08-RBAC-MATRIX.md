@@ -119,18 +119,20 @@ Legend: ✅ allowed · ❌ denied · ➖ not applicable (always denied) · ⚙�
 | Workspace status | Allowed | Everything else |
 |---|---|---|
 | `active` | as per matrix | — |
-| `pending_deletion` | Every `*.view` permission, `report.view`, `member.view`, `member.leave`; Owner additionally `workspace.cancel_deletion` and `report.export` (to take data out) | **Forbidden** (read-only) |
+| `pending_deletion` | Every `*.view` permission (`workspace.view`, `member.view`, `account.view`, `category.view`, `transaction.view`, `transaction.view_deleted`, `report.view`, `audit.view`), `member.leave`; Owner additionally `workspace.cancel_deletion` and `report.export` (to take data out). The role must still hold the permission (§3). `preference.default_account` is a write and is refused | **Forbidden** (read-only) |
 | purged | nothing; the workspace no longer exists → NotFound | — |
 
 User status overlay: `suspended` or `anonymized` → every permission is denied, including user-scoped ones (only `/start` returns a "suspended" notice).
+
+Implementation (Step 6B, F11): `authz/policy.py::_READ_ONLY_ALLOWED` derives the read set from the permission names; `tests/authz/expected_matrix.py::PENDING_DELETION_ALLOWED` transcribes this section independently, and `test_F11_role_permission_status_matrix` checks every role × permission × workspace status × user status cell (Step 6 had omitted `audit.view`).
 
 ## 6. Role change effects
 
 | Event | Immediate effect |
 |---|---|
-| Downgrade (e.g. Admin → Editor) | The next action is evaluated with the new role. Already-rendered buttons fail on press (G-2). Pending actions that need the old permission are invalidated. |
+| Downgrade (e.g. Admin → Editor) | The next action is evaluated with the new role. Already-rendered buttons fail on press (G-2). Pending actions that need the old permission are invalidated. Implemented (Step 6B): every role or status change bumps `workspace_memberships.version` (revision 0005 trigger); a draft or category prompt started under another version is expired on its next use, after the permission check (a refusal is audited). A promotion also ends the open conversation (owner decision pending, doc 10 §13.11). |
 | Downgrade to Viewer | The member's pending drafts in that workspace are expired. |
-| Removal or leave | Membership `status=removed/left`. Drafts and pending actions are expired. If this was their active workspace, it falls back to personal. The member is notified. |
+| Removal or leave | Membership `status=removed/left`. Drafts and pending actions are expired. If this was their active workspace, it falls back to personal. The member is notified. Implemented (Step 6B): while removed there is no session at all (NotFound); after a rejoin the old conversations are expired, never revived (membership version, R03). Notification is not built yet. |
 | Ownership transfer | Both parties are notified, and all members see the new owner in `/anggota`. |
 | User suspended | All sessions refused. Drafts expired. Pending ownership transfers *to* that user are cancelled. If they own business workspaces, those workspaces continue read-write for the other members; owner-only actions are unavailable until reactivation or a platform-assisted transfer (open item O-RBAC-1). |
 

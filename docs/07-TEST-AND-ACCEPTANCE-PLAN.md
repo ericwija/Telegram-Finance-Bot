@@ -100,6 +100,7 @@ for permission in ALL_WORKSPACE_PERMISSIONS (26):
 | AT-RBAC-R11-01 | Another user completes someone else's pending action | Forbidden |
 | AT-RBAC-S-01 | `B1` is pending deletion: every write permission for every role | Forbidden |
 | AT-RBAC-S-02 | `B1` is pending deletion: the owner cancels and exports | Allowed |
+| AT-RBAC-S-03 | Every role × permission × workspace status × user status cell (Step 6B, F11: `audit.view` and every `*.view` stay allowed while pending deletion; `tests/authz/test_policy_matrix.py::test_F11_role_permission_status_matrix`) | As docs/08 §3 and §5 |
 | AT-RBAC-U-01 | `u_suspended` performs any operation | Forbidden |
 | AT-RBAC-G2-01 | Render the transaction detail for `u_admin` (🗑️ shown) → owner demotes them to editor → press 🗑️ | Forbidden + `authz_denied` audit |
 | AT-RBAC-G2-02 | Render a member-management button for `u_admin` → removed from `B1` → press | NotFound |
@@ -189,6 +190,7 @@ All run as `finbot_app` against PostgreSQL 18 at **both** the service level and 
 | AT-TXN-REV-01 | Revisions | create → update → delete → restore gives 4 revisions with correct `changed_fields` |
 | AT-BAL-PROP-01 | Balances | Hypothesis state machine over create, edit, void, restore and type change; for every state, Σ account balances = Σ opening + Σ posted income − Σ posted expense, and Σ current transfer entries = 0 (INV-7) |
 | AT-ENV-01..06 | Environment guards | Each guard G-ENV-1…6 (doc 04 §8.3) blocks startup when violated; e.g. staging config + a DB marked `production` → exit code ≠ 0 with a guard log line |
+| AT-ENV-07 | Schema compatibility (Step 6B, F05) | A database at `0003`/`0004`, never migrated, at an unexpected revision or with an ambiguous `alembic_version` is refused before the poller lock, Telegram and a "ready" heartbeat; the bot never migrates (`tests/migration/test_schema_guard_migration_db.py`) |
 | AT-DEP-01 | Compose lint (`tests/deploy/test_staging_compose.py`) | `deploy/staging/compose.yml` (later `deploy/prod/compose.yml`), raw and rendered with `docker compose config`, has no `ports`/`expose` on `postgres`; the image is pinned by version and digest; healthchecks are present; the `db` network is internal; secrets only from git-ignored files; no V1/production names; non-root dedicated uid, read-only FS, `cap_drop: ALL`; `log_parameter_max_length=0`; `pg_hba.conf` has no weak methods; the init script never grants privileges to `finbot_app` or logs passwords |
 | AT-CFG-01..05 | Configuration | Missing required settings → a validation error naming the field; inline secrets rejected in staging/production; `*_FILE` secrets loaded and masked in `repr`; unknown `FINBOT_ENV` rejected; no I/O at import |
 | AT-RPT-01 | Reports | Fixture results equal an independent Python reference implementation |
@@ -246,6 +248,7 @@ AT-MIG-* covers the **V1 → V2 data import** (Phase 7). Schema-migration tests 
 |---|---|---|
 | P1 Step 2 | lint/format/type/import-linter, AT-CFG-*, AT-LOG-01 (skeleton), no-import-side-effects test | `uv run pytest` green locally |
 | P1 Steps 3–5 | + AT-RLS-00, AT-RLS-04, AT-RLS-05, AT-RLS-07, AT-RLS-COVERAGE (Phase 1 tables), AT-ENV-*, AT-DEP-01, AT-LOCK-01 | Fresh-VM staging compose bring-up |
+| Step 6B (remediation, doc 10 §13.10) | Step 6 row + AT-ENV-07, AT-RBAC-S-03, the F01–F12 and R01–R03 regressions (`test_finance_remediation_db.py`, `test_schema_guard_migration_db.py`), `0005` up/down/up and failure injection; CI job `security` (gitleaks, pip-audit, Trivy) | `make check`, `make test-db`, `make security`; image scan in CI |
 | Step 6 (ledger core, doc 10 §12.7) | AT-ENT-04…12, 16, 17, 19, 20; AT-ISO-01/03/05; AT-RLS-00/01/02/06 + COVERAGE for the ledger tables; AT-RBAC-SYNC-01, finance AT-RBAC-M rows, AT-RBAC-P-01, AT-RBAC-R9-02; AT-TXN-IDEMP-01, AT-TXN-OCC-01; AT-RPT-01; AT-RENDER-01; AT-LOG-01; AT-PARSE-PROP (amounts) | `make check` and `make test-db` |
 | P2 | AT-RBAC-* (all), AT-PWS-*, AT-RLS-*, AT-TOK-* | UAT-01, 03, 05 (members), 06, 07, 08 |
 | P3 | + AT-ISO-*, **AT-ENT-***, AT-PARSE-*, AT-TXN-*, AT-BAL-PROP-01, AT-RENDER-*, AT-TZ-01, AT-STATE-01 | UAT-02 (no AI), 04, 09 |

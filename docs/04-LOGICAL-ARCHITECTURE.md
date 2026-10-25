@@ -208,7 +208,7 @@ Replies are HTML with every interpolated value escaped, and link previews off. T
 
 **Running the bot: exactly one poller per environment (Step 4D; G-ENV-6, NFR-AVL-06, AC-P1-04).** `finbot bot [--health-file PATH]` (`adapters/telegram/runtime.py`) runs these steps in order, and polling starts only after all of them pass:
 
-1. **G-ENV-2, then G-ENV-3:** `current_database()` on the live connection must equal `FINBOT_DB_NAME` (already pinned to `finbot_<env>` by configuration), and `platform_meta.environment` must equal `FINBOT_ENV`.
+1. **G-ENV-2, then G-ENV-3, then G-ENV-7:** `current_database()` on the live connection must equal `FINBOT_DB_NAME` (already pinned to `finbot_<env>` by configuration), `platform_meta.environment` must equal `FINBOT_ENV`, and the schema revision (`public.app_schema_revision()`, revision 0005) must be one the release supports (Step 6B; the bot never migrates).
 2. **G-ENV-6:** the bot takes `pg_try_advisory_lock(<class>, hashtext('telegram-poller:<env>'))` on a **dedicated autocommit connection** (`infra/db/poller_lock.py`).
    - The lock is session-level, so it lasts as long as that connection.
    - A second process gets `false` and exits with code 3 and "poller lock held by another process". It never contacts Telegram.
@@ -235,7 +235,7 @@ Replies are HTML with every interpolated value escaped, and link previews off. T
 - A "poller lock held" refusal means another instance is live. Find it, and never work around the lock.
 - The in-memory duplicate and rate-limit state (`ratelimit.py`) relies on this single process.
 
-### 5.9 Finance core (Step 6, revision `0004`)
+### 5.9 Finance core (Step 6, revision `0004`; Step 6B, revision `0005`)
 
 **Modules** (layering of §3 enforced by import-linter):
 
@@ -243,23 +243,26 @@ Replies are HTML with every interpolated value escaped, and link previews off. T
 |---|---|---|
 | domain | `money.py`, `ledger.py`, `finance.py` | Whole-rupiah parsing and formatting; the entry sign rules (`build_entries`); names, dates and months in the workspace timezone; filters and report values; the capture and edit state machines. Pure |
 | authz | `permissions.py`, `policy.py`, `context.py` | The docs/08 matrix (`ROLE_PERMISSIONS`, personal and read-only overlays) and `authorize()`; `WorkspaceContext` built from the membership read in the request's transaction |
-| ports | `finance.py` | `FinanceStore.session(user, workspace, write)` = one unit of work (§5.3) plus `record_denial` |
-| infra | `db/finance.py` | PostgreSQL implementation: sets `app.user_id`, loads the **active** membership (`FOR SHARE` for writes), sets `app.workspace_id`, then bound-parameter queries with explicit workspace filters on top of RLS |
+| ports | `finance.py` | `FinanceStore.session(user, workspace, mode, request_id)` = one unit of work (§5.3) plus `record_denial`. `SessionMode`: `READ` (one `REPEATABLE READ READ ONLY` snapshot), `WRITE` (user, membership and workspace rows `FOR SHARE`), `SEED` (membership `FOR NO KEY UPDATE`); doc 10 §13.3 |
+| infra | `db/finance.py` | PostgreSQL implementation: sets `app.user_id`, loads the user and the **active** membership with the mode's locks, sets `app.workspace_id`, then bound-parameter queries with explicit workspace filters on top of RLS. A deadlock or serialization failure becomes `RetryLaterError` |
 | services | `finance.py`, `ledger.py`, `capture.py`, `principals.py` | Authorized sessions, idempotent seeding and the ledger writes; categories, history, detail, corrections, void/restore, reports; the capture and edit conversations persisted as drafts; Telegram sender → user |
 | adapters | `telegram/finance.py`, `finance_render.py`, `finance_callbacks.py` | Handlers (one service call each), HTML rendering with escaping, strict callback codec |
 
-**Request flow** for every finance update: gate (§5.8) → `PrincipalService.actor` (`resolve_principal`; unknown → onboarding text, suspended → refused) → one service method → `_session()` opens the unit of work and runs `authorize()` with the current membership, inside the same database transaction as the change (G-2), seeds defaults if missing, and commits. A `ForbiddenError` rolls back and writes `security.authz_denied` in its own short transaction (G-4). The adapter renders the result or maps an expected error to the catalogue.
+**Request flow** for every finance update: gate (§5.8) → a fresh request id → `PrincipalService.actor` (`resolve_principal`; unknown → onboarding text, suspended → refused) → one service method → `_session()` opens the unit of work and runs `authorize()` with the current membership (the method's permission, at least `workspace.view`), inside the same database transaction as the change (G-2), and commits. Missing defaults are seeded first in their own short `SEED` transaction (retried on deadlock; nothing financial is ever retried). A `ForbiddenError` rolls back and writes `security.authz_denied` (entity type, request id) in its own short transaction (G-4). The adapter renders the result, checks it against Telegram's limits, or maps an expected error to the catalogue.
 
 **Conversation flow** (`/catat`, `/pemasukan`, `/pengeluaran`; drafts in PostgreSQL):
 
 ```
-/catat ──► [Pemasukan|Pengeluaran] ──► amount (text) ──► [category buttons] ──► description (text | Lewati)
-                                                                                        │
-          ✅ Simpan ◄── summary: workspace (G-8), type, amount, category, description, date ──┘
-             │            └─ 📅 Tanggal ─► date (text) ─► summary          ❌ Batal / /batal at any step
-             ▼
+/catat ──► [Pemasukan|Pengeluaran] ──► amount (text) ──► [category buttons, paged ◀️ ▶️] ──► description (text | Lewati)
+                                                                                                │
+   ✅ Simpan ◄── summary: workspace (G-8), type, amount, category, description, date, account ──┘
+      │            └─ ✏️ Ubah ─► [Jenis | Jumlah | Kategori | Keterangan | Tanggal] ─► that step ─► summary
+      │                           (↩️ Kembali ke ringkasan leaves it unchanged)    ❌ Batal / /batal at any step
+      ▼
  "✅ Tersimpan …" (the same message is edited, so its buttons disappear)
 ```
+
+Step 6B: a ❌ cancels only its own conversation (draft or category prompt); conversations record the membership version and the resolved account; expiry is persisted before the refusal; a replayed ✅ is re-authorized (doc 10 §13.4).
 
 `/pengeluaran 25rb makan siang` fills the amount and description and goes straight to the category step. `/riwayat` lists ten transactions per page with number buttons. Each detail offers ✏️ Ubah (amount, category, description, date; an edit draft with its own confirmation), 🗑️ Hapus (with a confirmation) and ♻️ Pulihkan, each only if the caller's role allows it. `/kategori` lists categories and offers create, rename (pending action plus a typed name) and activate/deactivate. `/saldo` shows recorded balances per account, labelled as not being a bank statement; `/laporan [bulan]` shows a monthly summary.
 
@@ -391,7 +394,8 @@ networks: db (internal: true + gateway mode isolated; no egress, no host path; f
 | G-ENV-3 | `platform_meta.environment` = `FINBOT_ENV`. This stops a production dump restored into staging from being served by the staging bot |
 | G-ENV-4 | Telegram `getMe().username` = `TELEGRAM_EXPECTED_BOT_USERNAME`. This stops the production token from being used with the staging config, or the reverse. The setting is required in staging/production/drill (missing or invalid: configuration error, exit 2). Staging reads it from the git-ignored `deploy/staging/bot-identity.env`, never from a committed file (Step 5B) |
 | G-ENV-5 | In `production` and `staging`, every secret comes from a `*_FILE` path. Inline secret environment variables are rejected |
-| G-ENV-6 | Single-poller advisory lock acquired on a dedicated connection and re-checked while polling (NFR-AVL-06; §5.8). Order at start-up: G-ENV-2, G-ENV-3, G-ENV-6, G-ENV-4, then polling |
+| G-ENV-6 | Single-poller advisory lock acquired on a dedicated connection and re-checked while polling (NFR-AVL-06; §5.8). Order at start-up: G-ENV-2, G-ENV-3, G-ENV-7, G-ENV-6, G-ENV-4, then polling |
+| G-ENV-7 | The schema revision is in `infra/db/guards.py::SUPPORTED_SCHEMA_REVISIONS` (Step 6B). A database behind, ahead, never migrated or ambiguous is refused before the lock, Telegram and the "ready" heartbeat; migrations stay operator-run (doc 10 §13.5) |
 
 **Host and operators (D24, approved 2026-10-24):** staging runs on the existing Contabo VPS next to an unrelated `services` stack (`services-postgres` and `services-redis`, both published on 127.0.0.1 only; network `services_default`; volumes `services_*`). No V2 name, port, network or subnet overlaps with it, and V2 never attaches to `services_default`. Roles on the host: **`claude`** is the development user (repository, tests, static checks) and has **no Docker access**, by owner decision; **`deploy`** is the only Docker operator (pull, up, down, logs, exec); **root (sudo)** creates the `finbot-staging` group (gid 2999) and the secret files. Membership of the `docker` group is root-equivalent, so it stays limited to `deploy`.
 

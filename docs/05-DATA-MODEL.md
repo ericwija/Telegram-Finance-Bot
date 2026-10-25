@@ -414,6 +414,8 @@ CREATE TABLE pending_actions (               -- multi-step flows: rename, delete
 
 `drafts.proposal` stores the proposed header and legs (`[{leg, account_id, amount}]`). Its reference IDs (account and category) are re-validated against the workspace at confirm time, and the final INSERTs into `transactions` and `transaction_entries` are protected by the composite FKs and INV-1…INV-5 regardless.
 
+As implemented (Step 6B, doc 10 §13.4): a create draft's proposal holds `account_id` (the account resolved when the draft started, used at confirm even if the default changes) and every proposal and `pending_actions.payload` holds `membership_version`, the `workspace_memberships.version` at start. Revision `0005` bumps that version on every role or status change, so a conversation from before a downgrade, removal or rejoin is expired instead of revived.
+
 ## 6. Operational tables
 
 ```sql
@@ -557,6 +559,6 @@ Reconciliation output (`import_batches.stats`): for each user, rows read, import
 | **P4** | `ai_usage`; receipt extraction columns, if any are deferred from P3 |
 | **P7** | `import_batches` |
 
-The P1 row is implemented by revision `0001` (Step 3B.3); doc 10 §9 lists where it interprets this document. Of the P2 row, `telegram_identities`, `onboarding_invites`, `resolve_principal` and `redeem_onboarding_invite` are implemented by revision `0002` (Step 4A, doc 10 §10); the rest of the row is not yet built. Of the P3 row, revision `0004` (Step 6) creates `accounts`, `categories`, `transactions`, `transaction_entries`, `transaction_revisions`, `drafts`, `pending_actions` (moved here from P2 for category prompts), `current_entries`, the §5.2 triggers and `workspace_memberships.default_account_id`. It adds `transactions.currency` (IDR only, so reports group by currency), `drafts.purpose`/`target_transaction_id` (edit drafts) and `pending_actions.status`, and defers `receipts`, `receipt_id`, `import_ref` and `replaces_transaction_id` to later expand-only revisions. Details and reasons: doc 10 §12.
+The P1 row is implemented by revision `0001` (Step 3B.3); doc 10 §9 lists where it interprets this document. Of the P2 row, `telegram_identities`, `onboarding_invites`, `resolve_principal` and `redeem_onboarding_invite` are implemented by revision `0002` (Step 4A, doc 10 §10); the rest of the row is not yet built. Of the P3 row, revision `0004` (Step 6) creates `accounts`, `categories`, `transactions`, `transaction_entries`, `transaction_revisions`, `drafts`, `pending_actions` (moved here from P2 for category prompts), `current_entries`, the §5.2 triggers and `workspace_memberships.default_account_id`. It adds `transactions.currency` (IDR only, so reports group by currency), `drafts.purpose`/`target_transaction_id` (edit drafts) and `pending_actions.status`, and defers `receipts`, `receipt_id`, `import_ref` and `replaces_transaction_id` to later expand-only revisions. Details and reasons: doc 10 §12. Revision `0005` (Step 6B) adds `public.app_schema_revision()` (start-up guard G-ENV-7) and the `trg_membership_version` trigger; no table changes (doc 10 §13.2).
 
 Role passwords are not set by migrations. They are set from Docker secrets by the database init step (doc 04 §8.2).

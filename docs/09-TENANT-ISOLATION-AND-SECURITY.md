@@ -183,10 +183,13 @@ Used only when a tenant asks for help in writing, or for incident response.
 - **Receipts (D7):** images are processed in memory, never written to disk, and never stored. Extracted JSON is pruned after 90 days.
 - **User erasure (D14):** the profile is anonymized (`display_name` becomes `Pengguna dihapus`, email nulled), identities are unlinked, and memberships ended. The personal workspace is purged after 30 days. Business transactions created by the user remain (they belong to the business), attributed to the anonymized user ID. Audit actor IDs are kept, with no personal data.
 - **Workspace deletion (D13):** 30-day read-only grace, then a hard purge of all workspace rows. Backups age out according to retention (documented in the privacy notice).
+- **Database server log (Step 6B, R01; doc 10 §13.7):** statement parameters are never logged (`log_parameter_max_length_on_error = 0`), but a constraint violation logs its DETAIL: a unique violation the conflicting key (for example a category name), a CHECK violation the failing row (for example a draft's description). The application therefore never relies on a unique index to detect a duplicate name: name changes and seeding run under a per-workspace lock after a duplicate query, and the index is only a backstop (tested: no SQL error during duplicate operations). Proposed, pending owner approval: `ALTER ROLE finbot_app IN DATABASE <db> SET log_error_verbosity = 'terse'`, which drops DETAIL from the app role's errors and keeps it for `finbot_owner`.
+- **Correlation ids (Step 6B, F12):** every Telegram update gets a random request id, stored in `audit_events.request_id` for every event of that update (denials included) and in the application log, so an audit event can be matched to its log lines without logging any content.
 
 ## 11. Release security checklist
 
-- [ ] gitleaks, pip-audit and Trivy clean (no High or Critical findings).
+- [ ] gitleaks, pip-audit and Trivy clean (no High or Critical findings). CI job `security` (doc 10 §13.6); the image scan needs the image built in CI.
+- [ ] The bot's `SUPPORTED_SCHEMA_REVISIONS` (G-ENV-7) lists the revision the release was tested on, and the operator migrated before starting it.
 - [ ] The AT-RLS, AT-ISO and AT-RBAC suites pass against a fresh migration.
 - [ ] New tenant table? It has `workspace_id`, a composite FK, RLS ENABLE + FORCE, a policy, and a test in AT-RLS-COVERAGE.
 - [ ] New service method? It calls `authorize`, writes an audit event, and has its permission added to the matrix and the tests.

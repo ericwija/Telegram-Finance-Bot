@@ -181,7 +181,7 @@
 | `/saldo` | Account balances (Step 6: recorded balances, plus all-time income, expense and net) | — |
 | `/laporan` (`/ringkasan`) | Cash-flow report (Step 6: one calendar month, `/laporan [bulan]`) | `/laporan` |
 | `/riwayat` (`/transaksi`) | History; edit, delete and restore (Step 6: `[pemasukan\|pengeluaran] [dihapus] [bulan \| tanggal tanggal]`) | `/hapus` (replaced) |
-| `/akun`, `/kategori` | Manage accounts and categories (Step 6: `/kategori` only) | — |
+| `/akun`, `/kategori` | Manage accounts and categories (Step 6: `/kategori [pemasukan\|pengeluaran] [nonaktif]` and `/kategori tambah <jenis> <nama>`, paged; `nonaktif` lists deactivated categories to reactivate them, Step 6B) | — |
 | `/anggota`, `/undang` | Members and invitations | — |
 | `/ekspor` | CSV export | `/sheet` (replaced) |
 | `/audit` | Audit view | — |
@@ -192,6 +192,13 @@
 **Step 6 status (finance core, doc 10 §12).**
 - *Implemented:* FR-IDN-04 (lazily, on first use), FR-CAT-01…04, FR-TXN-01/02/02a (income and expense, through the D1 entry model), FR-TXN-04…06, FR-TXN-08, FR-TXN-09, FR-TXN-10 (without type change), FR-TXN-11, FR-ACC-04/05/06 (seeded "Kas" only), FR-RPT-01 (monthly), FR-RPT-02 (as of today) and FR-RPT-05.
 - *Not built yet:* FR-ACC-01…03, FR-TXN-03, FR-TXN-07, FR-TXN-12/13, FR-RPT-03/04 and FR-IDN-07's full menu (`/start` points to `/bantuan`).
+
+**Step 6B status (remediation, doc 10 §13).**
+- FR-TXN-04: the confirmation shows workspace, type, amount, date, **account**, category and description, with ✅ Simpan · ✏️ Ubah · ❌ Batal. The account is resolved when the draft starts and kept in the draft, so changing the default account later does not redirect it.
+- FR-TXN-05: **partly implemented.** ✏️ Ubah corrects type, amount, category, description and date, by buttons or a reply, and every correction returns to the complete confirmation. *Changing the account is not offered* until account management (FR-ACC-01) exists; only "Kas" can be chosen today.
+- FR-TXN-06: an expired draft is persisted as expired; a replay of a confirmed draft is re-authorized and never shows a voided transaction or one seen under an earlier membership.
+- FR-CAT-02/04: category lists are paged, so every category (including `Lainnya`) is reachable; deactivated categories are listed with `nonaktif` and can be reactivated.
+- Amounts in commands keep separated units: `/pengeluaran 2 juta sewa` is Rp 2.000.000 with the description "sewa"; an ambiguous amount (`2 jutaan`) is asked again.
 
 ## 13. Open items specific to this document
 

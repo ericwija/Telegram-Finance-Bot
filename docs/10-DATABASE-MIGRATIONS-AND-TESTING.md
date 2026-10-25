@@ -182,6 +182,7 @@ env -u PGHOST -u PGPORT -u PGDATABASE -u PGUSER -u PGPASSWORD \
 |---|---|---|
 | `checks` | `uv lock --check`, ruff, mypy, import-linter, `pytest -m "not db" --cov` (includes the AT-DEP-01 compose checks, which need only the Docker CLI) | |
 | `database` | Pulls the pinned image digest parsed from `deploy/staging/compose.yml`, then `make test-db` with `FINBOT_TEST_PG_BACKEND=container` | Fails if any database test is skipped. The testcontainers reaper is disabled (it would pull an extra, unpinned image); the fixture stops the container and the runner is ephemeral |
+| `security` (Step 6B) | gitleaks (whole history), pip-audit (locked set), Trivy fs (lockfile, Dockerfile), V2 image build + Trivy image | Pinned, checksum-verified scanners; any finding fails (Trivy: High/Critical). §13.6 |
 
 Supply chain:
 - `actions/checkout` is pinned to commit `08c6903c…` (v5.0.0), with `persist-credentials: false`;
@@ -405,13 +406,13 @@ Grants to `finbot_app` (S7): `SELECT, INSERT` on all seven tables; column-level 
 
 ### 12.2 Seeding (FR-IDN-04, FR-CAT-01, FR-ACC-05)
 
-The defaults live in application code (`domain/finance.py`: `DEFAULT_CATEGORIES`, `DEFAULT_ACCOUNT_*`), not in a migration or in the onboarding function. The first finance request of a member whose `default_account_id` is NULL, in an **active** workspace, runs `services/finance.py::ensure_finance_defaults` in its own transaction:
+The defaults live in application code (`domain/finance.py`: `DEFAULT_CATEGORIES`, `DEFAULT_ACCOUNT_*`), not in a migration or in the onboarding function. The first finance request of a member whose `default_account_id` is NULL, in an **active** workspace, runs `services/finance.py::ensure_finance_defaults` in its own short transaction, before the request's own one (Step 6B: `SessionMode.SEED`, membership locked `FOR NO KEY UPDATE` first, then the workspace's category-name lock; retried on deadlock; §13.3):
 
 1. if the workspace has no category at all (archived ones count), insert the documented FR-CAT-01 lists: income Gaji, Bonus, Penjualan, Investasi, Hadiah, Lainnya; expense Makanan, Transportasi, Belanja, Tagihan, Kesehatan, Pendidikan, Hiburan, Iuran, Lainnya (`Lainnya` is the default of each kind);
 2. if it has no active account, insert "Kas" (`cash`, opening balance 0, opening date 2000-01-01 so that back-dated entries count);
 3. set the member's default account to the oldest active account.
 
-Every insert is `ON CONFLICT DO NOTHING` against the unique indexes, so concurrent first requests seed exactly once (tested with five concurrent requests). Each inserted row is audited (`category.created` / `account.created`, `actor_kind = 'system'`, `seeded: true`). This is why the migration needs no data step. The Step 6 request listed slightly different default names. The approved document wins, and only the code list needs changing if the owner wants otherwise.
+Every insert is also `ON CONFLICT DO NOTHING` against the unique indexes, so concurrent first requests seed exactly once (tested with 20 concurrent reads and writes of five members; the Step 6 version deadlocked on concurrent first writes, F02). Each inserted row is audited (`category.created` / `account.created`, `actor_kind = 'system'`, `seeded: true`). This is why the migration needs no data step. The Step 6 request listed slightly different default names. The approved document wins, and only the code list needs changing if the owner wants otherwise.
 
 ### 12.3 Money, dates and currency
 
@@ -431,7 +432,7 @@ draft (pending) ──✅ confirm──► transaction (posted, v1, entries rev 
    └────────────────────────────────────────── void ("hapus") ⇄ restore (v+1 each; entries untouched)
 ```
 
-- **Confirm** locks the draft row (`FOR UPDATE`), writes the header, its entries, a revision and the audit event, and sets `drafts.status = 'confirmed'` in one transaction. A second confirm (double tap, Telegram retry, a concurrent press) finds the draft already confirmed and reports the same transaction: exactly one is stored (AT-TXN-IDEMP-01). Permission is checked at that moment (G-2, R-9).
+- **Confirm** locks the draft row (`FOR UPDATE`), writes the header, its entries, a revision and the audit event, and sets `drafts.status = 'confirmed'` in one transaction. A second confirm (double tap, Telegram retry, a concurrent press) finds the draft already confirmed and reports the same transaction: exactly one is stored (AT-TXN-IDEMP-01). Permission is checked at that moment (G-2, R-9); a replay is re-authorized and shows only a still-posted transaction under the same membership (Step 6B, §13.4).
 - **Edit** and **void/restore** use optimistic locking (`version`). A stale button or draft is refused and the user reopens the latest version (AT-TXN-OCC-01).
 - **Void** is the application's reversible delete: the transaction stops counting in balances, history and reports, and stays restorable from `/riwayat dihapus`. **A migration downgrade is a different thing:** dropping `0004` drops every finance table and its data. Downgrades are refused in staging and production (S9), and recovering from a bad schema change means restoring a backup (§12.6).
 
@@ -469,7 +470,9 @@ SELECT (SELECT count(*) FROM public.users) AS users,
 
 After the first finance command of a test account, its workspace has 15 categories and one "Kas" account, and its membership has a default account.
 
-### 12.6 Proposed staging deployment of Step 6 (operator-controlled; nothing here has been run)
+### 12.6 Proposed staging deployment of Step 6 (superseded by §13.8)
+
+**Superseded:** the Step 6B code requires revision `0005` (G-ENV-7); deploy `0004` and `0005` together with the consolidated procedure in §13.8. The text below is kept for the record.
 
 Each step needs owner approval, and is run by `deploy` per `deploy/staging/README.md`.
 
@@ -499,3 +502,148 @@ Each step needs owner approval, and is run by `deploy` per `deploy/staging/READM
 3. **Not built:** free-text capture and the local parser (FR-TXN-03, AT-PARSE-GOLDEN), the undo button (FR-TXN-13), type change (D21), revision history view (FR-TXN-12), the 6-month comparison (FR-RPT-03), CSV export, `/audit`, draft-expiry and prune jobs (expiry is enforced lazily on use), and `security.cross_tenant_probe` (R-12; NotFound is not audited).
 4. **Command names:** the documented names (docs/02 §12) plus the Step 6 aliases `/tambah`, `/transaksi`, `/ringkasan` and the shortcuts `/pemasukan`, `/pengeluaran`.
 5. **Open decisions applied with their documented defaults:** D2 (a) Editors edit any transaction, D15 negative balances allowed with ⚠️, D17 no period locking, D21 (a) the type is immutable, D22 (a) signed entries with leg names.
+
+## 13. Step 6B remediation (revision `0005`; independent review of Step 6)
+
+An independent review of `0411db8` concluded "not approved for staging" with twelve findings (F01–F12) and three risks to investigate (R01–R03). This section records what changed, the operating model that results, and the **consolidated operator procedure for deploying `0004` and `0005`** (§13.8), which replaces §12.6. Nothing in this section has been run against staging.
+
+### 13.1 Findings and resolutions
+
+| ID | Severity | Finding | Resolution | Regression tests |
+|---|---|---|---|---|
+| F01 | High | `confirm()` replay, `current()` and `cancel()` skipped authorization; a replay could show a later-edited or voided transaction to a downgraded or suspended user | Every finance session is authorized: with the method's permission, or at least `workspace.view` (denied to inactive users). A replay re-authorizes the draft's permission and `transaction.view`, requires the same membership epoch (§13.4), and never shows a voided transaction. `current()` offers only conversations the caller may still use. Voided rows are NotFound for roles without `transaction.view_deleted` everywhere (`services/finance.py::visible`) | `test_F01_*` (PostgreSQL), unit tests |
+| F02 | Medium | Two concurrent first requests deadlocked: `FOR SHARE` on the membership, then `UPDATE … default_account_id` (a lock upgrade). Reproduced on `0411db8`: 16 deadlocks in 24 concurrent first writes | Seeding moved to its **own short transaction** (`SessionMode.SEED`) that locks the membership `FOR NO KEY UPDATE` first (no upgrade), then the workspace's category-name lock; it is idempotent and posts nothing, so it alone is retried (3 attempts) on deadlock/serialization failure. Request transactions are never re-run automatically: a transient failure stores nothing and is answered "coba lagi" (`RetryLaterError`) | `test_F02_*`: 20 concurrent writes and reads by 5 members (the same user several times) on an unseeded workspace: 0 errors, seeded once |
+| F03 | Medium | `/saldo` read balances and totals in separate `READ COMMITTED` statements | Every read-only request is one `REPEATABLE READ READ ONLY` transaction (`SessionMode.READ`): all figures of a report come from one snapshot | `test_F03_a_report_reads_one_snapshot` (deterministic: a commit between two queries is not seen), `test_F03_reports_reconcile_under_concurrent_create_edit_and_void` |
+| F04 | Medium | `/pengeluaran 2 juta` recorded Rp 2 (`juta` became the description) | `domain/money.py::split_leading_amount` uses the `parse_amount` grammar for the leading amount, separated units included; a unit-like word after a bare number (`2 jutaan`) is refused, never guessed | `test_F04_*` (domain, adapter, Telegram, PostgreSQL end to end) |
+| F05 | Medium | The bot started on a database at `0003` | G-ENV-7 (`infra/db/guards.py::require_schema_revision`): before the poller lock, Telegram and the "ready" heartbeat, the revision read through `public.app_schema_revision()` must be in `SUPPORTED_SCHEMA_REVISIONS` (`{"0005"}`). Behind (`0003`, `0004`), never migrated, ahead or ambiguous → refused, exit 3. The bot never migrates | `test_schema_guard_migration_db.py` (AT-ENV-07), `test_schema_guard_revision.py` |
+| F06 | Medium | Category lists were capped (90 buttons) and could hide `Lainnya`; no size protection | Category management and the draft's category step are **paged** (20 per page, ◀️/▶️). Every reply is measured as Telegram does (UTF-16 units after entity parsing; ≤ 100 buttons) before sending; an oversized one is replaced by a short explanation. The fake Bot API now refuses oversized messages like Telegram | `test_F06_*` (45 and 30 extra categories, worst-case escaping and astral characters) |
+| F07 | Medium | Deactivated categories were not listed, so they could not be reactivated | `/kategori [pemasukan\|pengeluaran] nonaktif` and a "🗃️ Kategori nonaktif" button list them; detail → ✅ Aktifkan. Reactivation refuses an active namesake | `test_F06_F07_*`, `test_F07_deactivate_and_reactivate_end_to_end` |
+| F08 | Medium | A stale ❌ cancelled a newer category prompt | `cancel(ref)` cancels only the conversation whose reference is exactly `ref`; category prompts have their own reference and ❌ button; `/batal` cancels whatever is in progress | `test_F08_*` |
+| F09 | Medium | Confirming an expired draft rolled the `expired` status back (exception inside the transaction) | Expiry is persisted, the session commits, and the refusal is raised afterwards (confirm, buttons, text, prompts) | `test_F09_an_expired_draft_is_persisted_as_expired_on_confirm` |
+| F10 | Medium | The confirmation did not show the account; a later default-account change redirected the draft; no pre-save correction | The account is resolved when the draft starts, stored in `drafts.proposal.account_id`, shown on every summary, and used at confirm (an archived account is refused, not replaced). ✅ Simpan · ✏️ Ubah · ❌ Batal (FR-TXN-04): Ubah corrects type, amount, category, description or date; every correction returns to the complete confirmation; "↩️ Kembali ke ringkasan" leaves it unchanged. **Choosing another account is not offered** (only "Kas" exists; deferred with account management) | `test_F10_*` |
+| F11 | Low | `audit.view` was denied while a workspace was pending deletion | The read-only overlay allows every `*.view` permission (docs/08 §5) | `test_F11_role_permission_status_matrix`: 5 roles × 26 permissions × 2 workspace states × 3 user states against an independent expectation |
+| F12 | Low | Audit events lacked a correlation id; denials lost their entity type | Every Telegram update gets a request id; every audit event of its transactions (including seeding and denials) stores it in `audit_events.request_id`; denials record the entity type (`draft`, `transaction`, `category`) | `test_F12_*` |
+
+| ID | Investigation | Result |
+|---|---|---|
+| R01 | Can financial text reach the PostgreSQL server log? | Bound parameters are not logged (`log_parameter_max_length_on_error = 0`). **But a constraint violation logs its DETAIL**: a unique violation shows the key (a category name), a CHECK violation shows the failing row (a draft's proposal, with the description). Verified on a disposable 18.6 cluster with synthetic markers. Fixed in the application: name changes and seeding run under a per-workspace lock after a duplicate query, so the unique indexes never fire in normal operation (test: no SQL error at all during duplicate create/rename/reactivate and 4 concurrent creates). Residual risk: CHECK violations only on a bug. **Proposed (not applied)**: §13.7 |
+| R02 | Authorization and archive changes concurrent with mutations | WRITE sessions lock the user, membership and workspace rows `FOR SHARE`; postings lock their category and account `FOR SHARE`. A suspension, role change, removal, workspace status change, category archive or account archive therefore waits for an in-flight authorized write, or is seen by it. Proven with `lock_timeout` on a competing connection, plus concurrent archive/confirm and three-way concurrent edit/void (one wins, the others are stale or not found) |
+| R03 | Removal and rejoin | Revision `0005` bumps `workspace_memberships.version` on every role or status change (trigger), and every draft and category prompt stores the version it was started under. After a removal and rejoin (or any role change) the old conversation is expired, never revived; a downgrade is refused (and audited) first. Same-workspace privacy between two members: a member cannot see, confirm, correct or cancel another member's draft even with its reference |
+
+Reproduction on the baseline `0411db8` (scratch worktree, same cluster): F02 16 deadlocks/24, F09 status stayed `pending`, F01 a suspended user received the amount, F08 the stale ❌ returned `True`, F04 `('2', 'juta sewa')`, F11 `False`. The same script passes on the remediated code.
+
+### 13.2 Revision `0005_schema_guard_membership_epoch`
+
+Additive: two functions and one trigger; no table, column or row changes.
+
+| Object | Notes |
+|---|---|
+| `public.app_schema_revision()` | `LANGUAGE sql STABLE SECURITY DEFINER`, `SET search_path = pg_catalog, public`, owned by `finbot_owner`, `EXECUTE` for `finbot_app` only. Returns `alembic_version.version_num` if there is exactly one row, else NULL. `finbot_app` still has **no** privilege on `alembic_version` (AT-RLS-05 unchanged) |
+| `public.membership_version_bump()` + `trg_membership_version` | `BEFORE UPDATE OF role, status ON workspace_memberships`: `version := GREATEST(NEW.version, OLD.version + 1)` when the role or status changes (an updater that bumps it itself is not bumped twice). Invoker, `EXECUTE` granted to nobody. Setting `default_account_id` does not bump |
+
+Downgrade (dev/test/drill only) drops the three objects. Tested: populated `0004` → `0005` (rows unchanged) → `0004` (state identical) → `0005`; and failure injection (a conflicting function created first): the upgrade fails and the database is exactly at `0004`, including the statements that ran before the failure.
+
+**Bot/schema compatibility:** the Step 6B bot requires `0005` and refuses `0004`. The Step 5/6 bots run on `0005` too (additive), so a rollback of the image does not need a schema rollback.
+
+### 13.3 Session modes and lock order
+
+| Mode | Isolation | Row locks at start | Used by |
+|---|---|---|---|
+| `READ` | `REPEATABLE READ READ ONLY` | none | every read-only request (history, detail, categories, reports, `current`) |
+| `WRITE` | `READ COMMITTED` | `users` (own row) `FOR SHARE`, then `workspace_memberships` and `workspaces` `FOR SHARE` | every mutation, conversation step and denial-expiry |
+| `SEED` | `READ COMMITTED` | `users` `FOR SHARE`, then the membership `FOR NO KEY UPDATE` and the workspace `FOR SHARE` | first-use seeding only |
+
+Global order (every code path takes a subset of it, in this order, so no cycle exists): user → membership/workspace → conversation advisory lock (`finbot.conversation:<user>:<ws>`) or category-name advisory lock (`finbot.category-names:<ws>`) → category/account rows (`FOR SHARE` to post, `FOR UPDATE` to change) → transaction row (`FOR UPDATE`) → draft/pending-action row (`FOR UPDATE`). A deadlock or serialization failure (SQLSTATE 40P01/40001) rolls the whole request back and surfaces as `RetryLaterError`; only seeding is retried automatically.
+
+### 13.4 Conversations
+
+- A button carries an 8-hex reference of its draft or category prompt. The conversation is always the caller's own pending one (RLS `user_id = app_user_id()`); a mismatch is stale.
+- `proposal.membership_version` / `payload.membership_version` = the membership version at start. On use: expired → `expired`; else the draft's permission is checked (Forbidden, audited, the conversation expires: R-9); else a different version → `expired`. Expiry is committed before the refusal.
+- `proposal.account_id` = the account resolved at start (FR-ACC-05).
+- Replay (✅ on a confirmed draft): same permission, `transaction.view`, same membership version, transaction still posted → "sudah disimpan sebelumnya" with the **current** version; otherwise answered as an expired button.
+
+### 13.5 Start-up order
+
+G-ENV-2 (database name) → G-ENV-3 (environment marker) → **G-ENV-7 (schema revision)** → G-ENV-6 (poller lock) → G-ENV-4 (`getMe`) → polling → heartbeat `ready`. A G-ENV-7 refusal prints `refused: database schema revision …` and exits 3 without taking the lock or contacting Telegram; the heartbeat says `failed`, so the healthcheck reports unhealthy.
+
+### 13.6 Security gates (CI job `security`)
+
+| Gate | Tool and pin | Scope | Fails on |
+|---|---|---|---|
+| Secret detection | gitleaks 8.30.1 (linux x64 tarball, SHA-256 `551f6fc8…70eb` from the release checksums) | whole git history (`fetch-depth: 0`), values redacted in output | any finding |
+| Dependency audit | pip-audit 2.10.1 via `uvx` (PyPI version pin) | `uv export --frozen --all-groups` (hash-pinned requirements; `--require-hashes --disable-pip`, nothing installed) | any known vulnerability (`--strict`) |
+| Lockfile and Dockerfile | Trivy 0.75.0 (tarball SHA-256 `c6e65abd…3f3f`) | `trivy fs` vuln, secret and misconfig, V1 files skipped | High or Critical |
+| Image | Trivy 0.75.0 | the V2 image built in the job from the pinned base (not pushed) | High or Critical, fixed or not (NFR-SEC-06 as approved). An exception needs an owner-approved `.trivyignore` entry with reason and expiry |
+
+`make security` runs the first three locally (tool paths via `GITLEAKS=`/`TRIVY=`). None of them needs a secret.
+
+Local results on 2026-10-25 (same pinned versions, binaries checksum-verified in a scratch directory, nothing installed): gitleaks: no leaks in the V2 working tree and in 17 commits of V2-path history (V1 paths were not scanned: V1 is out of bounds for this work; **the CI job scans the whole history, V1 included, and may report findings there that need triage**); pip-audit: no known vulnerabilities in the 485-line locked set; Trivy fs: 0 High/Critical in `uv.lock`, 0 Dockerfile misconfigurations. **The image scan has not run anywhere** (the image has never been built; `claude` has no Docker). The workflow has not run on GitHub (nothing pushed).
+
+### 13.7 Proposed: PostgreSQL error detail for the app role (R01; not applied)
+
+The application no longer triggers name-revealing unique violations, but any CHECK violation (a bug) would log the failing row. Proposed for staging (and production later), run once by root/`deploy` as the PostgreSQL superuser, owner approval required:
+
+```sql
+ALTER ROLE finbot_app IN DATABASE finbot_staging SET log_error_verbosity = 'terse';
+```
+
+Verified on a disposable cluster: `finbot_app` sessions then log errors without DETAIL (the failing row and key values disappear), while `finbot_owner` keeps full detail for migrations and operator work. It takes effect for new connections (restart the bot). Trade-off: less detail when debugging app errors, which the structured application log covers by error type. Alternative (not recommended): `-c log_error_verbosity=terse` for the whole server in `deploy/staging/compose.yml`, which also hides detail from migrations.
+
+### 13.8 Consolidated staging procedure for `0004` + `0005` (operator-only; nothing here has been run)
+
+Every step needs owner approval and is run by `deploy` (Docker) or root (secrets) per `deploy/staging/README.md`. `F=deploy/staging/compose.yml`; `owner_psql` is the README §7 helper. Stop at the first unexpected result.
+
+1. **Predeployment checks.** `git log -1` on the reviewed checkout = the approved commit; `docker compose -f $F ps` (postgres healthy, bot stopped or the Step 5 bot running); `df -h /var/lib/docker` ≥ 5 GiB; `docker compose -f $F run --rm migrate current` → `0003` (if `0001`–`0003` are not applied yet, do README §7 first, up to `0003`); `migrate history` → `0001 … 0005`; README §9.1 preflight (token file present, `bot-identity.env` valid, `check-config` exit 0).
+2. **Image provenance and revision.** Build per README §6.2 from the reviewed commit; `docker image inspect -f '{{index .Config.Labels "org.opencontainers.image.revision"}}' finbot-v2:staging` = that commit; base digest as pinned in `deploy/docker/Dockerfile`; `finbot bot --dry-run` lists `/catat … /kategori` and `callback_query`. Keep the previous image tagged `finbot-v2:staging-<previous sha>` for rollback.
+3. **Backup.** README §12.1; record the file name and `sha256sum` in the deployment log.
+4. **Backup validation.** `pg_restore --list <file> | head` succeeds and lists `alembic_version`, `workspace_memberships`; the file is non-empty and in the 0700 directory.
+5. **Restore rehearsal (isolated).** Restore the dump into a **separate, disposable** database or cluster (never `finbot_staging`) with the README §12.2 `pg_restore` flags and compare row counts. Rehearsed locally with synthetic data on 2026-10-25 (`pg_dump` as `finbot_backup`, `pg_restore --no-owner --exit-on-error --single-transaction` as `finbot_owner`: counts identical, 13 RLS-forced tables, definer ownership kept, G-ENV-2/3/7 pass on the copy, the app reads the correct balance). **Recovery of a real staging backup has not been proven**; do this step before relying on it.
+6. **Migration SQL review.** `docker compose -f $F run --rm --no-deps migrate sql upgrade 0003:0005 > ~/finbot-staging-migrations/upgrade_0003_0005_$REV.sql`; check the guard header, compare with `migrations/versions/0004_*.py` and `0005_*.py`, no credentials. `0004`: new tables, one nullable column with an FK on `workspace_memberships` (brief `ACCESS EXCLUSIVE`, `lock_timeout 10s`). `0005`: two functions and a trigger.
+7. **Controlled bot shutdown.** `docker compose -f $F stop bot` (graceful: README §9.3); confirm `ps bot` shows it stopped and its last log lines show `bot.stopped` and `poller_lock.released` (README §9.3).
+8. **Migration by the operator.** `docker compose -f $F run --rm migrate upgrade 0005; echo "exit $?"`: one transaction; non-zero leaves `0003` (check with `current`).
+9. **Post-migration verification.** §12.5 queries (expect `0005` instead of `0004` for the version) and §13.9.
+10. **Application start and health.** `docker compose -f $F up -d bot`; `ps bot` healthy within ~60 s; logs show `poller_lock.acquired`, `bot.polling_started` and no `refused:`; `finbot healthcheck --json`; restarts=0; second-instance refusal (README §9.3). A `refused: database schema revision` means step 8 did not reach `0005`.
+11. **Telegram smoke tests** (synthetic test account, staging bot only): `/bantuan`; `/pengeluaran 2 juta sewa` → shows Rp 2.000.000 and "Akun: Kas" → ✏️ Ubah → Jumlah → `1,5 juta` → ✅ → press ✅ again ("sudah disimpan sebelumnya"); `/catat` → ❌ on an older message (stale, nothing cancelled); `/riwayat` → detail → 🗑️ → `/riwayat dihapus` → ♻️; `/saldo`; `/laporan`; `/kategori tambah pengeluaran Uji` → deactivate → `/kategori nonaktif` → ✅ Aktifkan. Logs: no message text, amounts or tokens (README §10).
+12. **Rollback and forward-fix decisions.**
+    - Application problem, schema fine: `stop bot`; retag the previous image. A Step 5/6 image runs on `0005` (additive). `up -d bot`.
+    - `migrate upgrade` failed: nothing applied (one transaction); fix and repeat step 8.
+    - Schema wrong, no tester data yet: README §12.2 with the step-3 backup (downgrades are refused in staging, S9).
+    - Testers have recorded data: prefer a reviewed forward-fix revision; a restore loses everything since step 3.
+    - Optional, separately approved: §13.7 (`log_error_verbosity` for `finbot_app`).
+
+### 13.9 Verification after `upgrade 0005` (read-only, as `finbot_owner`)
+
+```sql
+SELECT version_num FROM public.alembic_version;                                     -- 0005
+-- The guard function: owner-owned definer, executable by the app only; the app has no table access.
+SELECT p.prosecdef, pg_get_userbyid(p.proowner),
+       has_function_privilege('finbot_app', p.oid, 'EXECUTE'),
+       has_function_privilege('public', p.oid, 'EXECUTE'),
+       has_table_privilege('finbot_app', 'public.alembic_version', 'SELECT')
+FROM pg_proc p WHERE p.proname = 'app_schema_revision';                             -- t | finbot_owner | t | f | f
+-- The membership-epoch trigger exists and is enabled.
+SELECT tgname, tgenabled FROM pg_trigger WHERE tgname = 'trg_membership_version';    -- trg_membership_version | O
+SELECT has_function_privilege('finbot_app', 'public.membership_version_bump()', 'EXECUTE');  -- f
+```
+
+### 13.10 Tests added in Step 6B
+
+| File | Covers |
+|---|---|
+| `tests/integration/test_finance_remediation_db.py` | F01 (replay after edit, downgrade, promotion, void, suspension, removal; `current`), F02 (concurrent first use, read-only reads), F03 (snapshot, concurrent reconciliation), F08, F09, F10 (default-account change, archived account, every correction), F06/F07, F12, R01 (no SQL error on duplicates), R02 (lock waits for suspension, role change, removal, workspace status, category and account archive; concurrent archive/confirm; concurrent edit/void), R03 (removal and rejoin, version trigger), two-member draft privacy |
+| `tests/migration/test_schema_guard_migration_db.py` | AT-ENV-07 (head passes; `0003`, `0004`, never migrated, unexpected, two rows, no rows refused; the bot never polls or reports ready on `0004`), `0005` up/down/up on populated data, failure injection |
+| `tests/integration/test_telegram_finance_db.py` (3 more) | separated units + correction + replay, stale ❌, deactivate/reactivate, end to end |
+| `tests/unit/test_schema_guard_revision.py` | offline `0005` SQL (one narrow grant, no table privilege, additive), supported revision = head |
+| `tests/unit/test_telegram_finance.py`, `test_finance_adapter.py`, `test_finance_domain.py`, `tests/authz/test_policy_matrix.py` | every command and alias, separated units (12 cases) and ambiguous ones, corrections, restart replay, stale buttons, category pages and reactivation, expiry, suspension, oversized replies, `RetryLaterError`, the role × permission × status matrix |
+
+### 13.11 Scope and owner decisions
+
+Implemented scope is §12 plus §13.1. Still deferred (unchanged from §12.8 unless stated): workspace switching (`/ruang`), account management and transfers (so the draft's account cannot be changed in ✏️ Ubah yet), free-text capture, undo, type change of posted transactions (D21), revision view, 6-month comparison, CSV export, `/audit`, expiry/prune jobs, `security.cross_tenant_probe`.
+
+Decisions for the owner (not treated as approved):
+
+1. **§13.7** `log_error_verbosity = terse` for `finbot_app` (R01).
+2. **Trivy strictness:** unfixed High/Critical base-image CVEs fail the image gate as NFR-SEC-06 is written; if that blocks releases, approve either `--ignore-unfixed` or a `.trivyignore` process.
+3. **pip-audit pin:** the tool is pinned by version (PyPI), not by hash; approve, or ask for a hash-pinned tool requirements file.
+4. **A role change expires the member's open conversation** (R03 design), including a promotion; accept, or ask for promotions to keep it.
+5. **D25** (CI platform), and the open defaults applied in §12.8 (D2, D15, D17, D21, D22), remain open.
