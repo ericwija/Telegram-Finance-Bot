@@ -186,6 +186,7 @@
 | `/audit` | Audit view | — |
 | `/profil` | Profile and default account | `/me` |
 | `/status` | Platform admin health | — |
+| `/undangan_baru`, `/undangan_daftar`, `/undangan_cabut` | Platform admin: create, list and revoke onboarding invites (FR-IDN-01; private chat only; doc 04 §5.8) | — |
 
 ## 13. Open items specific to this document
 

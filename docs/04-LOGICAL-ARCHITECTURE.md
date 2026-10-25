@@ -189,6 +189,23 @@ The **backup** itself runs in a separate container (doc 06 §Deployment), not in
 - Telegram linking (FR-IDN-09) is a service in `onboarding.py`. The web creates the token, and the Telegram `/start lnk_…` handler consumes it.
 - Runs as a separate container, behind Caddy or Traefik with TLS. The bot container stays unchanged.
 
+### 5.8 Telegram adapter (Step 4C)
+
+`adapters/telegram/bot.py` wires python-telegram-bot 22.x (long polling; `allowed_updates` = `message`, `my_chat_member`; at most 8 updates processed concurrently, which keeps database connections under `finbot_app`'s limit of 20). Every update passes these checks in order, before any database access:
+
+1. a duplicate `update_id` is dropped (bounded in-memory set);
+2. the bot leaves any group, supergroup or channel it is added to, and ignores all non-private chats (T16);
+3. updates without a human sender are ignored;
+4. the per-user rate limit applies (NFR-SEC-07: 30 updates/min, one notice per window).
+
+`/start` payloads have a second limit (T17, AT-TOK-04). After 10 bad payloads (refused or malformed invites) in a minute, further payloads from that account are answered with the same rate-limit notice without calling the database, whether or not the account or the invite exists. `/start` without a payload is never limited by it.
+
+The platform-admin invite commands (`/undangan_baru [catatan]`, `/undangan_daftar [semua]`, `/undangan_cabut <ID>`; doc 08 §3.3 "bot DM") act as the **verified Telegram sender**. No argument names the actor. An unknown account gets only the onboarding explanation (FR-IDN-02); an onboarded non-admin gets the G-4 message.
+
+Replies are HTML with every interpolated value escaped, and link previews off. Telegram API errors on a reply are logged by type only; other handler errors are logged by type only and answered with a generic message. `httpx`, `httpcore` and `telegram` loggers are set to WARNING because httpx logs request URLs, which contain the bot token.
+
+`finbot bot --dry-run` builds the whole application offline (a transport that refuses every Bot API call, an engine that never connects) and prints the commands and limits. `finbot bot` long-polls after checking the database environment marker (G-ENV-3) and the bot username (G-ENV-4). The single-poller advisory lock (G-ENV-6) is not implemented yet. The in-memory limits assume one bot process per environment.
+
 ## 6. Request flows
 
 ### 6.1 Text capture → confirm

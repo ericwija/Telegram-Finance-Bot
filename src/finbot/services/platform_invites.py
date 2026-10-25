@@ -61,8 +61,12 @@ class PlatformInviteService:
             or not principal.is_platform_admin
         ):
             logger.warning("platform admin required", extra={"event": "security.authz_denied"})
-            raise PlatformAdminRequiredError("an active platform admin is required")
+            raise PlatformAdminRequiredError(linked=principal is not None)
         return principal.user_id
+
+    async def require_admin(self, actor_telegram_user_id: int) -> None:
+        """Raise unless the account is an active platform admin (no other effect)."""
+        await self._authorize_admin(actor_telegram_user_id)
 
     async def create(
         self, actor_telegram_user_id: int, *, note: str | None, channel: Channel

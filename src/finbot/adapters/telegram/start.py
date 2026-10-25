@@ -56,15 +56,20 @@ def _workspace_name(result: StartResult) -> str:
     return html.escape(result.workspace.name)
 
 
-async def handle_start(service: OnboardingService, update: StartUpdate) -> str | None:
-    """The HTML reply to ``/start``, or None when the update must not be answered."""
+def start_request(update: StartUpdate) -> StartRequest | None:
+    """The service request for a ``/start`` update, or None when it must not be answered."""
     if update.chat_type != "private":
         return None
-    result = await service.start(
-        StartRequest(
-            telegram_user_id=update.telegram_user_id,
-            first_name=update.first_name,
-            payload=start_payload(update.text),
-        )
+    return StartRequest(
+        telegram_user_id=update.telegram_user_id,
+        first_name=update.first_name,
+        payload=start_payload(update.text),
     )
-    return render(result)
+
+
+async def handle_start(service: OnboardingService, update: StartUpdate) -> str | None:
+    """The HTML reply to ``/start``, or None when the update must not be answered."""
+    request = start_request(update)
+    if request is None:
+        return None
+    return render(await service.start(request))

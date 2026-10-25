@@ -17,6 +17,8 @@ dependencies = [
     "sqlalchemy[asyncio]>=2.0.36,<2.1",
     "asyncpg>=0.30,<1",
     "alembic>=1.14,<2",
+    # Telegram (Step 4C): long polling via the async Application; httpx transport.
+    "python-telegram-bot>=22.8,<23",
 ]
 
 [project.scripts]
@@ -133,13 +135,15 @@ forbidden_modules = [
     "finbot.ports",
     "finbot.config",
     "pydantic_settings",
+    "telegram",
+    "sqlalchemy",
 ]
 
 [[tool.importlinter.contracts]]
 name = "Services and authz never depend on infrastructure or adapters (use ports)"
 type = "forbidden"
 source_modules = ["finbot.services", "finbot.authz"]
-forbidden_modules = ["finbot.infra", "finbot.adapters"]
+forbidden_modules = ["finbot.infra", "finbot.adapters", "telegram", "sqlalchemy"]
 
 [[tool.importlinter.contracts]]
 name = "Channel adapters are independent of each other"

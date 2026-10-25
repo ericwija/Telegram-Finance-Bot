@@ -84,7 +84,17 @@ _BOT_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
 
 
 class PlatformAdminRequiredError(PermissionError):
-    """The acting user is not an active platform admin (docs/08 §3.3)."""
+    """The acting user is not an active platform admin (docs/08 §3.3).
+
+    ``linked`` says whether the Telegram account belongs to any user at all, so that an unknown
+    account can be answered with the onboarding explanation only (FR-IDN-02).
+    """
+
+    def __init__(
+        self, message: str = "an active platform admin is required", *, linked: bool = True
+    ):
+        super().__init__(message)
+        self.linked = linked
 
 
 class InviteStatus(StrEnum):
