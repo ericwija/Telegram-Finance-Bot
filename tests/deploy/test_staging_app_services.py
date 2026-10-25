@@ -6,6 +6,8 @@ pass is then validated with the real settings loaders, with fake secret files.
 """
 
 import re
+import shutil
+import subprocess
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -21,7 +23,14 @@ DOCKERFILE = ROOT / "deploy" / "docker" / "Dockerfile"
 DOCKERIGNORE = ROOT / "deploy" / "docker" / "Dockerfile.dockerignore"
 CI = ROOT / ".github" / "workflows" / "ci.yml"
 README = ROOT / "deploy" / "staging" / "README.md"
+COMPOSE = ROOT / "deploy" / "staging" / "compose.yml"
+IDENTITY_FILE = ROOT / "deploy" / "staging" / "bot-identity.env"
+IDENTITY_EXAMPLE = ROOT / "deploy" / "staging" / "bot-identity.env.example"
+USERNAME_VAR = "FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME"
+#: A syntactically valid, fictitious username for loader tests (never a real bot).
+TEST_USERNAME = "example_staging_test_bot"
 HEALTH_FILE = "/run/finbot/heartbeat.json"
+BASE_RE = re.compile(r"python:3\.13\.\d+-slim-trixie@sha256:[0-9a-f]{64}")
 SECRETS_GID = "2999"
 
 
@@ -46,6 +55,27 @@ def _with_fake_secrets(
             name = value.removeprefix("/run/secrets/")
             patched[key] = str(secret_file(values[name], name, mode=0o440))
     return patched
+
+
+def _bot_env(secret_file: Callable[..., Path]) -> dict[str, str]:
+    """The bot's rendered environment with fake secrets and WITHOUT the operator's identity file.
+
+    Rendering merges deploy/staging/bot-identity.env when it exists, so the username is removed
+    here to keep the tests independent of the machine they run on.
+    """
+    env = _with_fake_secrets(
+        _service("bot")["environment"],
+        secret_file,
+        {"db_app_password": "fake-app-password", "telegram_token": fake_telegram_token()},
+    )
+    env.pop(USERNAME_VAR, None)
+    return env
+
+
+def _load(monkeypatch: pytest.MonkeyPatch, env: dict[str, str]) -> Any:
+    for key, value in env.items():
+        monkeypatch.setenv(key, value)
+    return load_settings(env)
 
 
 # ---------------------------------------------------------------------------------- bot
@@ -113,39 +143,80 @@ def test_bot_gets_only_application_secrets_as_files() -> None:
 def test_bot_environment_passes_the_real_settings_loader(
     monkeypatch: pytest.MonkeyPatch, secret_file: Callable[..., Path]
 ) -> None:
-    env = _with_fake_secrets(
-        _service("bot")["environment"],
-        secret_file,
-        {"db_app_password": "fake-app-password", "telegram_token": fake_telegram_token()},
-    )
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
-    settings = load_settings(env)
+    settings = _load(monkeypatch, _bot_env(secret_file) | {USERNAME_VAR: TEST_USERNAME})
     assert settings.env == "staging"
     assert settings.db_name == "finbot_staging"
     assert settings.telegram_token is not None
+    assert settings.telegram_expected_bot_username == TEST_USERNAME
 
 
 def test_owner_password_in_the_bot_environment_is_refused(
     monkeypatch: pytest.MonkeyPatch, secret_file: Callable[..., Path]
 ) -> None:
-    env = _with_fake_secrets(
-        _service("bot")["environment"],
-        secret_file,
-        {"db_app_password": "fake-app-password", "telegram_token": fake_telegram_token()},
-    )
+    env = _bot_env(secret_file) | {USERNAME_VAR: TEST_USERNAME}
     env["FINBOT_DB_OWNER_PASSWORD_FILE"] = str(secret_file("fake-owner", "owner", mode=0o440))
-    for key, value in env.items():
-        monkeypatch.setenv(key, value)
     with pytest.raises(ConfigurationError):
-        load_settings(env)
+        _load(monkeypatch, env)
 
 
-def test_expected_bot_username_placeholder_is_documented() -> None:
-    username = _service("bot")["environment"]["FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME"]
-    if username == "CHANGE_ME_staging_bot":  # fails closed at G-ENV-4 until replaced
-        assert "CHANGE_ME_staging_bot" in README.read_text("utf-8")
-    assert username.lower().endswith("bot")
+# ------------------------------------------------------------------- bot identity (G-ENV-4)
+
+
+def test_bot_without_the_identity_file_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, secret_file: Callable[..., Path]
+) -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        _load(monkeypatch, _bot_env(secret_file))
+    assert any(USERNAME_VAR in p and "required in staging" in p for p in caught.value.problems)
+
+
+@pytest.mark.parametrize("value", ["", "   ", "@", "not-a-bot-name", "finbot_staging", "x" * 40])
+def test_empty_or_invalid_username_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, secret_file: Callable[..., Path], value: str
+) -> None:
+    with pytest.raises(ConfigurationError) as caught:
+        _load(monkeypatch, _bot_env(secret_file) | {USERNAME_VAR: value})
+    assert any(USERNAME_VAR in p for p in caught.value.problems)
+
+
+def test_unedited_example_identity_file_fails_closed(
+    monkeypatch: pytest.MonkeyPatch, secret_file: Callable[..., Path]
+) -> None:
+    entries = [
+        line.split("=", 1)
+        for line in IDENTITY_EXAMPLE.read_text("utf-8").splitlines()
+        if line.strip() and not line.lstrip().startswith("#")
+    ]
+    assert entries == [[USERNAME_VAR, ""]], "the example holds exactly one, empty, variable"
+    with pytest.raises(ConfigurationError):
+        _load(monkeypatch, _bot_env(secret_file) | dict(entries))
+
+
+def test_username_is_never_committed_in_compose_or_examples() -> None:
+    code = _code(COMPOSE)
+    assert USERNAME_VAR not in code, "the username comes only from bot-identity.env"
+    for path in (COMPOSE, README, IDENTITY_EXAMPLE, DOCKERFILE):
+        assert "CHANGE_ME" not in path.read_text("utf-8"), path
+    # Exactly one env_file, on the bot, optional for compose (other services keep working).
+    block = code[code.index("\n  bot:\n") :]
+    assert re.search(
+        r"^    env_file:\n      - path: bot-identity\.env\n        required: false$", block, re.M
+    )
+    assert code.count("env_file:") == 1
+
+
+def test_identity_file_is_git_ignored_and_only_the_example_is_tracked() -> None:
+    git = shutil.which("git")
+    if git is None or not (ROOT / ".git").exists():
+        pytest.skip("git checkout not available")
+    ignored = subprocess.run(
+        [git, "check-ignore", "--quiet", "--no-index", str(IDENTITY_FILE)], cwd=ROOT, check=False
+    )
+    assert ignored.returncode == 0, "deploy/staging/bot-identity.env must be git-ignored"
+    example = subprocess.run(
+        [git, "check-ignore", "--quiet", "--no-index", str(IDENTITY_EXAMPLE)], cwd=ROOT, check=False
+    )
+    assert example.returncode == 1, "the example must stay trackable"
 
 
 # ------------------------------------------------------------------------------ migrate
@@ -198,12 +269,20 @@ def test_only_the_bot_reaches_the_internet() -> None:
 # -------------------------------------------------------------------------------- image
 
 
-def test_image_base_has_no_default_and_uv_matches_ci() -> None:
+def test_image_base_is_pinned_by_tag_and_verified_digest_and_uv_matches_ci() -> None:
     text = DOCKERFILE.read_text("utf-8")
-    assert re.search(r"^ARG PYTHON_BASE\s*$", text, re.M), "no default: the digest is mandatory"
+    base = re.search(r"^ARG PYTHON_BASE=(\S+)$", text, re.M)
+    assert base, "the reviewed base is recorded as the default"
+    assert BASE_RE.fullmatch(base[1]), base[1]
+    tag, digest = base[1].split("@")
+    # The verification record names the same index digest and the linux/amd64 manifest.
+    assert f"{tag.split(':')[1]}, verified read-only against registry-1.docker.io" in text
+    assert f"index (multi-arch) {digest}" in text
+    assert re.search(r"linux/amd64 manifest sha256:[0-9a-f]{64}", text)
     assert re.findall(r"^FROM (\S+)", text, re.M) == ["${PYTHON_BASE}", "${PYTHON_BASE}"]
-    # A floating tag is refused inside the build, not only by review.
+    # Overrides are checked inside the build, and only linux/amd64 is built.
     assert "python:3\\.13\\.\\d+-slim-trixie@sha256:[0-9a-f]{64}" in text
+    assert re.search(r'^RUN test "\$\{TARGETPLATFORM:-linux/amd64\}" = "linux/amd64"', text, re.M)
     ci = CI.read_text("utf-8")
     for name in ("UV_VERSION", "UV_SHA256"):
         dockerfile_value = re.search(rf"^ARG {name}=(\S+)$", text, re.M)

@@ -76,6 +76,7 @@ temp/
 *.tmp
 # ---- V2 (finbot) ----
 deploy/secrets/
+deploy/staging/bot-identity.env
 .ruff_cache/
 .mypy_cache/
 .coverage.*

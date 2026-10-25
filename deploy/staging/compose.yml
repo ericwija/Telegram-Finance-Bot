@@ -22,7 +22,8 @@
 #   * the postgres image is pinned by version AND digest; a change is a reviewed PR (doc 04
 #     §8.2). The app image is local (`pull_policy: never`) and built from a digest-pinned base.
 #   * secrets come only from git-ignored files in deploy/secrets/staging/ (no inline values,
-#     no variable interpolation, no .env file). The owner password reaches only `migrate`;
+#     no variable interpolation, no .env file). The one env_file (bot only) holds the non-secret
+#     staging bot username. The owner password reaches only `migrate`;
 #     the bot gets only the app password and the Telegram token (S10).
 
 name: finbot-staging
@@ -212,6 +213,15 @@ services:
       - bot
       - --health-file
       - /run/finbot/heartbeat.json
+    # FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME (G-ENV-4; not a secret) is the only value from outside
+    # this file: deploy/staging/bot-identity.env, git-ignored, written by the operator from
+    # bot-identity.env.example (README §2.3). Optional for compose, so commands for the other
+    # services keep working without it; REQUIRED by finbot in staging: missing, empty or invalid
+    # means "configuration INVALID" (exit 2) and the bot never starts. Keys under `environment:`
+    # take precedence over the file, so it cannot override anything below.
+    env_file:
+      - path: bot-identity.env
+        required: false
     environment:
       FINBOT_ENV: staging
       FINBOT_LOG_LEVEL: INFO
@@ -222,9 +232,6 @@ services:
       FINBOT_DB_APP_USER: finbot_app
       FINBOT_DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
       FINBOT_TELEGRAM_TOKEN_FILE: /run/secrets/telegram_token
-      # Not a secret. Placeholder until the owner names the staging bot (README §2.3); with it,
-      # G-ENV-4 refuses to start, so the wrong token can never be served (fail closed).
-      FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME: CHANGE_ME_staging_bot
       FINBOT_AI_ENABLED: "false"
       FINBOT_RECEIPTS_ENABLED: "false"
       FINBOT_EXPORT_ENABLED: "false"

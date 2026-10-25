@@ -46,7 +46,7 @@ from finbot.adapters.telegram.bot import (
     quiet_transport_loggers,
 )
 from finbot.adapters.telegram.ratelimit import BAD_STARTS_PER_MINUTE, UPDATES_PER_MINUTE
-from finbot.config import Settings
+from finbot.config import STRICT_ENVIRONMENTS, Settings
 from finbot.infra.heartbeat import BotState, Heartbeat
 from finbot.services.onboarding import OnboardingService
 from finbot.services.platform_invites import PlatformInviteService
@@ -298,6 +298,11 @@ def run_polling(
     """Long-poll Telegram until SIGTERM/SIGINT. Never called by tests or the dry run."""
     if settings.telegram_token is None:
         raise BotStartupError("FINBOT_TELEGRAM_TOKEN_FILE is required to run the bot")
+    if settings.env in STRICT_ENVIRONMENTS and settings.telegram_expected_bot_username is None:
+        # Configuration already requires it there; never poll with the identity check skipped.
+        raise BotStartupError(
+            "FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME is required in this environment (G-ENV-4)"
+        )
     quiet_transport_loggers()
     asyncio.run(_run(settings, settings.telegram_token.get_secret_value(), health_file, timings))
 

@@ -84,7 +84,9 @@ def test_no_interpolation_env_files_or_inline_secrets() -> None:
     code = _code(COMPOSE)
     assert "${" not in code, "no variable interpolation in staging compose"
     assert "$$" not in code, "no variable interpolation in staging compose"
-    assert not re.search(r"^\s*env_file\s*:", code, re.M)
+    # One env_file only: the bot's non-secret identity file (test_staging_app_services.py).
+    assert len(re.findall(r"^\s*env_file\s*:", code, re.M)) == 1
+    assert len(re.findall(r"^\s*- path:\s*bot-identity\.env\s*$", code, re.M)) == 1
     # Only *_FILE variables may name a secret, and they must point into /run/secrets.
     for name, value in re.findall(r"^\s+([A-Z][A-Z0-9_]*):\s*(.*)$", code, re.M):
         if re.search(r"PASSWORD|TOKEN|SECRET|API_KEY|CREDENTIAL", name):

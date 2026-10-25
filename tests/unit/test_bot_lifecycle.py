@@ -339,3 +339,13 @@ def test_bot_command_exit_codes(
     assert main(["bot"], out=io.StringIO(), err=err) == code
     assert err.getvalue().startswith(prefix)
     assert "G-ENV-6" in err.getvalue()
+
+
+def test_strict_environment_never_polls_without_an_expected_username(
+    staging_env: dict[str, str],
+) -> None:
+    from finbot.config import load_settings  # noqa: PLC0415
+
+    settings = load_settings().model_copy(update={"telegram_expected_bot_username": None})
+    with pytest.raises(BotStartupError, match="G-ENV-4"):
+        runtime.run_polling(settings)

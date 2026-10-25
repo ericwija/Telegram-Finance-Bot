@@ -94,13 +94,36 @@ sudo ls -l deploy/secrets/staging/telegram_token     # -r--r----- root finbot-st
 Store it in the staging vault. Never `cat` the file, paste it in a chat or ticket, or pass it
 as `-e` to `docker run`.
 
-### 2.3 Staging bot username (owner, reviewed commit)
+### 2.3 Staging bot username (deploy, once per bot)
 
-`FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME` in `deploy/staging/compose.yml` (service `bot`) is
-**`CHANGE_ME_staging_bot`** until the owner names the staging bot. With the placeholder, the
-bot refuses to start at G-ENV-4 (exit 3, "the bot token belongs to another bot"), so nothing is
-served by mistake. Replace it with the real username (without `@`) in a reviewed commit on
-`develop`; it is not a secret. The deployed checkout must contain that commit.
+The username that the token must belong to (G-ENV-4) is not a secret, but it is **not
+committed**: it lives only in `deploy/staging/bot-identity.env`, git-ignored, the bot's only
+`env_file`. Create it from the committed example with the username of the staging bot from
+§2.2 (without `@`):
+
+```bash
+cd ~/Telegram-Finance-Bot
+install -m 0644 deploy/staging/bot-identity.env.example deploy/staging/bot-identity.env
+nano deploy/staging/bot-identity.env   # FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME=<username without @>
+# Exactly that one variable besides comments: this prints NOTHING when the file is right.
+grep -vE '^(#.*|[[:space:]]*|FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME=[A-Za-z][A-Za-z0-9_]{1,28}[Bb][Oo][Tt])$' \
+  deploy/staging/bot-identity.env
+git check-ignore deploy/staging/bot-identity.env   # prints the path: ignored, never committed
+```
+
+Why only one line: compose passes every line of the file into the bot container (keys already
+set under `environment:` in compose win), so anything else, such as `PYTHONPATH`, would reach
+the process. The check above refuses that. Never put the token or a password in this file.
+
+Fail-closed behaviour:
+
+| State of `bot-identity.env` | Result |
+|---|---|
+| missing | compose still works for `postgres` and `migrate`; the bot exits **2**: `FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME is required in staging` |
+| copied but not edited (empty value), or not a bot username | the bot exits **2** (`configuration INVALID`, names the variable) |
+| a valid username of **another** bot | the bot exits **3** at G-ENV-4 (`the bot token belongs to another bot`) before polling |
+
+`git clean -X` would delete the file (it is ignored): recreate it from the example.
 
 ### 2.4 Secrets per service
 
@@ -179,37 +202,64 @@ There is no host port. Connect from inside the container (superuser, break-glass
 ## 6. Build the V2 image (deploy, from a reviewed checkout)
 
 The image is built on the VPS from the reviewed `develop` commit; compose never builds or pulls
-it (`pull_policy: never`). The Python base has **no default** in the Dockerfile: the build fails
-unless an exact tag **and** digest are passed.
+it (`pull_policy: never`).
+
+### 6.1 Build inputs
+
+Every input is version-controlled; only the choice of commit is made at build time.
+
+| Input | Value | Recorded in |
+|---|---|---|
+| Source | the reviewed commit on `develop` (clean checkout) | image label `org.opencontainers.image.revision` |
+| Python base | `python:3.13.17-slim-trixie@sha256:d98cc29d3266e535dd9da1099688d9cb3ca4753813571e071763d17725460962` (multi-arch index); linux/amd64 manifest `sha256:d879ed88565a7a3c614b980b369d4a5025a9d057b71f93d09fc6d0b2ca823a18`; verified read-only against `registry-1.docker.io` on 2026-10-25 | `deploy/docker/Dockerfile`, default of `ARG PYTHON_BASE` and the comment above it |
+| Platform | `linux/amd64` only (the VPS is x86_64; any other platform stops the build) | Dockerfile `TARGETPLATFORM` check |
+| uv | 0.12.23, SHA-256 `9167d72b3319674b6303c4cbe071854bba13ebdf3d76b1a7cbdc175471fb66d6` (same as CI) | Dockerfile `ARG UV_VERSION`, `ARG UV_SHA256` |
+| Python packages | `uv.lock`, `uv sync --frozen --no-dev` (hashes checked) | `uv.lock` |
+| Build context | allow-list: `pyproject.toml`, `uv.lock`, `README.md`, `alembic.ini`, `migrations/`, `src/` (no V1 files, `.env` or `deploy/secrets/`) | `deploy/docker/Dockerfile.dockerignore` |
+
+Do **not** pass `--build-arg PYTHON_BASE`. The build refuses anything but an exact
+`python:3.13.<patch>-slim-trixie@sha256:<digest>` anyway, but the reviewed default is the
+only base that should run on staging.
+
+### 6.2 Build and smoke-test
 
 ```bash
 cd ~/Telegram-Finance-Bot                         # the deploy checkout (never edited by hand)
 git fetch origin && git checkout --detach <reviewed commit on develop>
 test -z "$(git status --porcelain)" || { echo "checkout not clean"; exit 1; }
 REV=$(git rev-parse --short=12 HEAD)
+BASE=$(sed -n 's/^ARG PYTHON_BASE=//p' deploy/docker/Dockerfile)
 
-# Resolve the base once per Python update and record it in the deployment log. Use the newest
-# 3.13.x slim-trixie tag; copy the "Digest:" of the multi-arch index, not a per-platform one.
-docker buildx imagetools inspect python:3.13.<x>-slim-trixie | head -n 5
-BASE=python:3.13.<x>-slim-trixie@sha256:<64 hex from the line above>
+# Preflight (read-only, pulls no layers): the registry still serves that tag at that digest.
+docker buildx imagetools inspect "${BASE%@*}" | sed -n 's/^Digest: *//p'   # = the digest in $BASE
 
-docker build --pull -f deploy/docker/Dockerfile \
-  --build-arg PYTHON_BASE="$BASE" \
+docker build --pull --platform linux/amd64 -f deploy/docker/Dockerfile \
   --label org.opencontainers.image.revision="$(git rev-parse HEAD)" \
-  --label org.finbot.python-base="$BASE" \
   -t "finbot-v2:staging-$REV" -t finbot-v2:staging .
 
 # Offline smoke tests: no network, read-only, no secrets.
+docker image inspect -f '{{.Os}}/{{.Architecture}} user={{.Config.User}} rev={{index .Config.Labels "org.opencontainers.image.revision"}}' finbot-v2:staging
+                                                  # linux/amd64 user=65534:65534 rev=<the commit>
+docker run --rm --network none --read-only --entrypoint python finbot-v2:staging -c 'import sys; print(sys.version)'   # 3.13.17
 docker run --rm --network none --read-only finbot-v2:staging finbot version
 docker run --rm --network none --read-only -e FINBOT_ENV=dev finbot-v2:staging finbot bot --dry-run
-docker image inspect -f '{{json .Config.Labels}} {{.Config.User}}' finbot-v2:staging
 ```
 
-The build context is limited by `deploy/docker/Dockerfile.dockerignore` (an allow-list:
-`pyproject.toml`, `uv.lock`, `README.md`, `alembic.ini`, `migrations/`, `src/`), so V1 files,
-`.env` and `deploy/secrets/` never enter it. Dependencies come only from `uv.lock`
-(`uv sync --frozen --no-dev`); uv itself is verified against the CI checksum. Keep the previous
-`finbot-v2:staging-<sha>` tag until the new one is verified (§12.3).
+If the preflight prints another digest, the tag was rebuilt upstream: the pinned digest still
+builds the reviewed base (Docker resolves the digest, not the tag), so continue, and plan a §6.3
+update. Keep the previous `finbot-v2:staging-<sha>` tag until the new one is verified (§12.3).
+
+### 6.3 Updating the Python base (reviewed commit)
+
+1. Choose the newest `3.13.<patch>-slim-trixie` tag.
+2. Resolve it read-only: `docker buildx imagetools inspect python:<tag>` shows the index
+   `Digest:` and a `linux/amd64` entry. Without Docker (as on 2026-10-25): request an anonymous
+   pull token from `auth.docker.io`, `GET /v2/library/python/manifests/<tag>` with the OCI index
+   `Accept` header, and check that `Docker-Content-Digest` equals the SHA-256 of the body. Then
+   fetch the linux/amd64 manifest and its config blob and check `os=linux`,
+   `architecture=amd64` and `PYTHON_VERSION`.
+3. Change the `ARG PYTHON_BASE` default and its verification comment in
+   `deploy/docker/Dockerfile`, and the §6.1 table. `tests/deploy` checks the format.
 
 ## 7. Migrations 0001–0003 (operator-controlled, owner approval)
 
@@ -316,8 +366,25 @@ SQL
 
 ## 9. Start the bot (owner approval)
 
-Preconditions: §2.2 token file, §2.3 username committed in the deployed checkout, §6 image,
-§7.4 verified. §8 is needed before any invite can be created.
+Preconditions: §2.2 token file, §2.3 identity file, §6 image, §7.4 verified. §8 is needed
+before any invite can be created.
+
+### 9.1 Preflight (offline: no Telegram, no polling, no database connection)
+
+```bash
+test -f deploy/secrets/staging/telegram_token && echo "token file present"   # never cat it
+sudo ls -l deploy/secrets/staging/telegram_token                            # -r--r----- root finbot-staging
+grep -vE '^(#.*|[[:space:]]*|FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME=[A-Za-z][A-Za-z0-9_]{1,28}[Bb][Oo][Tt])$' \
+  deploy/staging/bot-identity.env                                           # prints nothing (§2.3)
+docker compose -f $F run --rm --no-deps --entrypoint finbot bot check-config; echo "exit $?"
+```
+
+`check-config` inside the bot container validates exactly what the bot will use: exit 0 with
+`env staging`, `db_name finbot_staging`, the expected username, and the token and app password
+shown only as `set (file: /run/secrets/…)`. Exit 2 lists each problem by variable name, never a
+value. It contacts neither Telegram nor PostgreSQL.
+
+### 9.2 Start and verify
 
 ```bash
 docker compose -f $F up -d bot                     # starts only bot (postgres is already up); never migrate
@@ -337,13 +404,15 @@ unless-stopped` then retries with Docker's backoff, so fix the cause and `up -d 
 | `G-ENV-2` | connected to another database | `FINBOT_DB_NAME` / `FINBOT_DB_HOST` in compose |
 | `G-ENV-3` or `database environment check failed` | schema missing (§7 not done) or wrong marker | run §7; never edit the marker |
 | `poller lock held` | another bot process for staging is running | find and stop it (`docker ps`); never work around the lock |
-| `G-ENV-4` | token of another bot, or the `CHANGE_ME_staging_bot` placeholder | §2.2 / §2.3 |
+| `G-ENV-4` | the token belongs to another bot than `bot-identity.env` names | §2.2 / §2.3 |
 | `Telegram getMe failed (InvalidToken)` | token revoked or mistyped | §2.2 |
-| `configuration INVALID` (exit 2) | missing secret file, wrong permissions, unknown variable | the message names the variable and path, never a value |
+| `configuration INVALID` (exit 2) | missing or empty `bot-identity.env`, missing secret file, wrong permissions, unknown variable | §2.3 / §2.2; the message names the variable and path, never a value |
 
 Exit 4 (`stopped: poller lock lost`) means the bot lost its database session while polling and
 stopped polling; Docker restarts it and it must win the lock again. Repeated exit 4 points at
 database or network trouble (§4).
+
+### 9.3 Exactly one poller and graceful stop
 
 **Exactly one poller (AC-P1-04).** Prove that a second instance is refused before it contacts
 Telegram:

@@ -357,7 +357,7 @@ networks: db (internal: true + gateway mode isolated; no egress, no host path; f
 | G-ENV-1 | `FINBOT_ENV` ∈ {`dev`, `test`, `staging`, `production`, `drill`} and is set explicitly (no default) |
 | G-ENV-2 | `SELECT current_database()` = `finbot_${FINBOT_ENV}` (`finbot_prod` for production): statically in configuration, and on the live connection before the bot starts (`infra/db/guards.py`, Step 5A) |
 | G-ENV-3 | `platform_meta.environment` = `FINBOT_ENV`. This stops a production dump restored into staging from being served by the staging bot |
-| G-ENV-4 | Telegram `getMe().username` = `TELEGRAM_EXPECTED_BOT_USERNAME`. This stops the production token from being used with the staging config, or the reverse |
+| G-ENV-4 | Telegram `getMe().username` = `TELEGRAM_EXPECTED_BOT_USERNAME`. This stops the production token from being used with the staging config, or the reverse. The setting is required in staging/production/drill (missing or invalid: configuration error, exit 2). Staging reads it from the git-ignored `deploy/staging/bot-identity.env`, never from a committed file (Step 5B) |
 | G-ENV-5 | In `production` and `staging`, every secret comes from a `*_FILE` path. Inline secret environment variables are rejected |
 | G-ENV-6 | Single-poller advisory lock acquired on a dedicated connection and re-checked while polling (NFR-AVL-06; §5.8). Order at start-up: G-ENV-2, G-ENV-3, G-ENV-6, G-ENV-4, then polling |
 
