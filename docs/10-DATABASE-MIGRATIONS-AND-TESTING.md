@@ -2,7 +2,7 @@
 
 | | |
 |---|---|
-| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9) and **Step 4A** (revision `0002`, identity and onboarding; §10). Step 4A awaits owner review |
+| **Status** | Phase 1 Step 3B.2 (tooling: migration environment, credential separation, test harness, CI workflow) **Step 3B.3** (revision `0001`, the Phase 1 baseline; §9) **Step 4A** (revision `0002`, identity and onboarding; §10) and **Step 4B** (revision `0003`, platform-admin bootstrap and invites; §11). Step 4B awaits owner review |
 | **Date** | 2026-10-24 |
 | **Decisions** | S1–S11 approved 2026-10-24 (§8); D9, D18, D24 (doc 01 §8) |
 | **Related** | [04 Architecture](04-LOGICAL-ARCHITECTURE.md) §8 · [05 Data Model](05-DATA-MODEL.md) §8, §11 · [07 Tests](07-TEST-AND-ACCEPTANCE-PLAN.md) · [09 Security](09-TENANT-ISOLATION-AND-SECURITY.md) |
@@ -328,6 +328,45 @@ Application side: `domain/identity.py` (token parsing, SHA-256, display-name nor
 4. **The display name falls back to `Pengguna`** when the Telegram first name has nothing printable. Control and Unicode format characters (including bidi overrides) are removed, whitespace is collapsed, and the result is cut to 64 characters.
 5. **Malformed `/start` payloads** (not `onb_` followed by 22 to 60 URL-safe characters) are treated as "no invite". They are not sent to the database and not audited; only well-formed tokens that fail are audited.
 6. **A failed-invite audit row records only the reason**, not the Telegram user ID, to keep identifiers of people who were never onboarded out of the audit log.
-7. **Not implemented yet:** invite creation and revocation (FR-IDN-01 CLI; `created_by` needs an existing platform-admin user, so bootstrapping the first admin is an open decision), the `/start` rate limit (T17, AT-TOK-04), `telegram_username` (the documented signature has no parameter for it), `user_preferences.active_workspace_id` (the personal workspace is shown as the active one), and the main menu (FR-IDN-07; no features exist yet). The Telegram framework is not wired in: `python-telegram-bot` is not a dependency, and adding it needs approval (Phase 1 Step 4).
+7. **Not implemented yet** (invite creation, listing and revocation followed in Step 4B, §11): the `/start` rate limit (T17, AT-TOK-04), `telegram_username` (the documented signature has no parameter for it), `user_preferences.active_workspace_id` (the personal workspace is shown as the active one), and the main menu (FR-IDN-07; no features exist yet). The Telegram framework is not wired in: `python-telegram-bot` is not a dependency, and adding it needs approval (Phase 1 Step 4).
 
 Tests: `tests/integration/test_onboarding_db.py` (first and repeat onboarding, refusals and their audit, concurrent redeems for one account and for one invite, rollback inside the function and by the caller, argument validation, tenant isolation, no direct table access, function privileges), `tests/migration/test_identity_migration_db.py` (0001 ↔ 0002 lifecycle, head → base), `tests/unit/test_identity_revision.py` (offline SQL), `tests/unit/test_identity_domain.py`, `tests/unit/test_onboarding_service.py`. The Phase 1 tests now pin revision `0001` where they test the baseline alone, and AT-RLS-COVERAGE, AT-RLS-05 and AT-RLS-06 include the identity tables and functions.
+
+## 11. Platform-admin bootstrap and invite management (revision `0003`, Step 4B)
+
+**Owner decision (2026-10-25):** the first platform admin is created **once**, by the operator, as `finbot_owner`, through `finbot-migrate bootstrap-admin`. That subcommand is separate from upgrade and downgrade: it runs no Alembic code, is never run by a migration or at application start-up, and the bot's credentials can never perform it.
+
+| Function (revision `0003`) | Security | Behaviour |
+|---|---|---|
+| `bootstrap_platform_admin(tg_user_id bigint, display_name text)` | **Not** `SECURITY DEFINER`; **no `EXECUTE` grant** (only its owner `finbot_owner` can run it); also refuses any `session_user` other than `finbot_owner`; fixed `search_path` | First claims the permanent `platform_meta` key `platform_admin_bootstrapped` (`ON CONFLICT DO NOTHING`; a concurrent bootstrap waits on it and is then refused). Refuses an already-linked Telegram account. Creates the admin user (`is_platform_admin`), identity, personal workspace and owner membership; audits `platform_admin.bootstrapped`, `user.onboarded`, `identity.linked`, `workspace.created` (`actor_kind = 'system'`, channel `cli`). The marker is never removed, so the bootstrap stays closed even if the admin is later suspended, demoted or unlinked, and also after a `0003` downgrade and re-upgrade |
+| `create_onboarding_invite(token_hash bytea, note text, channel text)` | `SECURITY DEFINER`, `EXECUTE` for `finbot_app` only | Requires `app_user_id()` to be an active platform admin. Stores only the 32-byte digest; fixed 7-day expiry, single use (FR-IDN-01); optional note of up to 200 printable characters; audits `onboarding_invite.created` (`actor_kind = 'platform_admin'`) |
+| `list_onboarding_invites(include_inactive boolean)` | same | Admin check; returns `(invite_id, status, created_at, expires_at, note, created_by, used_by)`, **never `token_hash`**; status is `active`, `used`, `revoked` or `expired` |
+| `revoke_onboarding_invite(invite_id uuid, channel text)` | same | Admin check; locks the invite; returns `revoked`, or `not_found`, `used`, `already_revoked` or `expired` without changing anything. Audits `onboarding_invite.revoked` only when it revokes. A revoke racing a redeem has exactly one effect |
+
+The application layer (`services/platform_invites.py`) authorizes first: the `--as` Telegram account must resolve to an active platform admin (docs/08 §3.3), and the database checks it again. Tokens are 128-bit (`secrets.token_urlsafe(16)`); only their SHA-256 leaves the process.
+
+### 11.1 Operator instructions
+
+All commands run where the respective credentials are mounted (Step 5: the one-shot `migrate` container for owner commands, the `bot` container for `finbot-admin`). Nothing here is run against staging until Step 5.
+
+1. **Migrate:** `finbot-migrate upgrade` (to `0003` or later).
+2. **Bootstrap the first admin, once:**
+   `finbot-migrate bootstrap-admin --telegram-user-id <your numeric Telegram ID> --display-name "<name>"`
+   Both arguments are required; there is no default. It checks the database's environment marker against `FINBOT_ENV` (G-ENV-3). Exit 0 prints only the new user ID; exit 3 means refused (already bootstrapped, account already linked, wrong environment, schema too old, invalid input). The output never contains credentials.
+3. **Create an invite** (app role, as the admin):
+   `finbot-admin invite create --as <admin Telegram ID> [--note "<who it is for>"]`
+   The `t.me/<bot>?start=onb_…` link is printed **once, on stdout only**. Deliver it privately to one person. It is not stored (only its hash is) and cannot be shown again; if it is lost, revoke the invite and create a new one. Do not paste it into tickets or chats that others can read.
+4. **List invites:** `finbot-admin invite list --as <admin Telegram ID> [--all]` (metadata only).
+5. **Revoke an unused invite:** `finbot-admin invite revoke --as <admin Telegram ID> <invite_id>`. Exit 3 tells you why nothing changed.
+
+`--as` attributes the action to an admin and is checked against the database. It is not authentication: whoever can run `finbot-admin` already holds the bot's database credentials, so access to the bot container must stay limited to the `deploy` operator (doc 04 §8.3).
+
+**Interpretations and limits** (owner review requested):
+
+1. **Expiry is fixed at 7 days** (FR-IDN-01). There is no option to change it.
+2. **Unauthorized attempts are refused but not audited:** the refusal rolls back the function's transaction. The service logs `security.authz_denied` (no identifiers beyond the event) instead.
+3. **Invite notes are free text chosen by the operator**, stored in the database and shown by `list`. They are never logged.
+4. **`FINBOT_INVITES_ENABLED` does not gate onboarding invites.** Its scope is undocumented; gating onboarding on it would block all new users. It is left for workspace invitations.
+5. **Not implemented:** the bot-DM channel for invites (docs/08 §3.3 "+ bot DM"; the functions already accept channel `telegram`), suspend/reactivate (FR-IDN-06), and a full `authz/policy.py` (the platform check lives in the service for now).
+
+Tests: `tests/integration/test_platform_admin_db.py`, `tests/migration/test_platform_admin_migration_db.py` (CLI end to end, `0003` lifecycle, marker kept across downgrade), `tests/unit/test_admin_revision.py`, `tests/unit/test_platform_invites.py`. AT-RLS-06 includes the three invite functions.

@@ -1,4 +1,6 @@
-"""Static checks of revision 0002 (identity and onboarding) through its offline SQL."""
+"""Static checks of revision 0002 (identity and onboarding) through its offline SQL.
+
+Head SQL (all revisions) is checked for psql safety here too."""
 
 import io
 import re
@@ -25,8 +27,9 @@ def head_sql(monkeypatch: pytest.MonkeyPatch) -> str:
 
 
 @pytest.fixture
-def identity_sql(head_sql: str) -> str:
-    return head_sql[head_sql.index("CREATE TABLE public.telegram_identities") :]
+def identity_sql(monkeypatch: pytest.MonkeyPatch) -> str:
+    sql = _sql(monkeypatch, "upgrade", "0002")
+    return sql[sql.index("CREATE TABLE public.telegram_identities") :]
 
 
 def test_head_sql_is_psql_safe(head_sql: str) -> None:

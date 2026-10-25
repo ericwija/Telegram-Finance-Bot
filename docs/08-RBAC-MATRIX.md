@@ -88,7 +88,7 @@ Legend: ✅ allowed · ❌ denied · ➖ not applicable (always denied) · ⚙�
 
 | Permission | Channel | Notes |
 |---|---|---|
-| `platform.onboarding_invite.create/revoke` | CLI (+ bot DM for the admin) | |
+| `platform.onboarding_invite.create/revoke` | CLI (+ bot DM for the admin) | `finbot-admin invite create/list/revoke` (doc 10 §11). The first platform admin is created once by the operator with `finbot-migrate bootstrap-admin` (owner role), never through the bot |
 | `platform.user.suspend/reactivate/anonymize` | CLI | audit-logged |
 | `platform.status` | bot `/status` and CLI | no tenant data |
 | `platform.backup.run/verify/restore` | CLI on the host | |

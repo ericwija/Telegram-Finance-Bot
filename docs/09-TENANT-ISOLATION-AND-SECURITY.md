@@ -125,7 +125,7 @@ CREATE POLICY tenant_isolation ON transactions
 
 | Domain | Actions |
 |---|---|
-| Identity | `user.onboarded`, `user.suspended`, `user.reactivated`, `user.anonymized`, `identity.linked`, `identity.unlinked`, `onboarding_invite.created/revoked/redeemed/failed` |
+| Identity | `user.onboarded`, `user.suspended`, `user.reactivated`, `user.anonymized`, `identity.linked`, `identity.unlinked`, `onboarding_invite.created/revoked/redeemed/failed`, `platform_admin.bootstrapped` (once per database, doc 10 §11) |
 | Workspace | `workspace.created`, `workspace.updated`, `workspace.deletion_requested`, `workspace.deletion_cancelled`, `workspace.purged`, `workspace.ownership_transfer_initiated/accepted/declined/expired` |
 | Members | `invitation.created/revoked/accepted/failed`, `member.role_changed`, `member.removed`, `member.left` |
 | Ledger | `account.created/updated/archived/unarchived`, `category.created/updated/archived`, `transaction.created/updated/voided/restored/type_changed`, `draft.created/confirmed/cancelled/expired` (drafts: counts only, sampled) |

@@ -12,6 +12,7 @@ import hashlib
 import re
 import unicodedata
 from dataclasses import dataclass
+from datetime import datetime
 from enum import StrEnum
 from uuid import UUID
 
@@ -73,3 +74,58 @@ def normalize_display_name(first_name: str | None) -> str:
     cleaned = "".join(ch for ch in text if unicodedata.category(ch) not in ("Cc", "Cf"))
     cleaned = " ".join(cleaned.split())[:DISPLAY_NAME_MAX].strip()
     return cleaned or FALLBACK_DISPLAY_NAME
+
+
+# ------------------------------------------------------------ platform: onboarding invites
+
+#: FR-IDN-01: invites are single use and expire after 7 days (fixed in the database function).
+INVITE_VALIDITY_DAYS = 7
+_BOT_USERNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_]{3,31}")
+
+
+class PlatformAdminRequiredError(PermissionError):
+    """The acting user is not an active platform admin (docs/08 §3.3)."""
+
+
+class InviteStatus(StrEnum):
+    ACTIVE = "active"
+    USED = "used"
+    REVOKED = "revoked"
+    EXPIRED = "expired"
+
+
+class RevokeOutcome(StrEnum):
+    """``revoked``, or why nothing changed."""
+
+    REVOKED = "revoked"
+    NOT_FOUND = "not_found"
+    USED = "used"
+    ALREADY_REVOKED = "already_revoked"
+    EXPIRED = "expired"
+
+
+@dataclass(frozen=True, slots=True)
+class InviteSummary:
+    """Invite metadata for listings. Never contains the token or its hash."""
+
+    id: UUID
+    status: InviteStatus
+    created_at: datetime
+    expires_at: datetime
+    note: str | None
+    created_by: UUID
+    used_by: UUID | None
+
+
+def onboarding_payload(token: OnboardingToken) -> str:
+    return f"{ONBOARDING_PREFIX}{token.value}"
+
+
+def onboarding_link(token: OnboardingToken, bot_username: str | None) -> str:
+    """``https://t.me/<bot>?start=onb_<token>``, or the bare ``/start`` command without a bot."""
+    if bot_username is None:
+        return f"/start {onboarding_payload(token)}"
+    name = bot_username.removeprefix("@")
+    if not _BOT_USERNAME_RE.fullmatch(name):
+        raise ValueError("invalid bot username")
+    return f"https://t.me/{name}?start={onboarding_payload(token)}"

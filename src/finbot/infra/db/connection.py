@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING, Any
 
 from pydantic import SecretStr
 
+from finbot.config import Settings
 from finbot.migration_settings import MigrationSettings
 
 if TYPE_CHECKING:
@@ -56,6 +57,20 @@ def owner_target(settings: MigrationSettings) -> ConnectionTarget:
         user=settings.db_owner_user,
         password=settings.require_owner_password(),
         application_name="finbot-migrate",
+    )
+
+
+def app_target(settings: Settings, *, application_name: str = "finbot") -> ConnectionTarget:
+    """The ``finbot_app`` target (the bot and ``finbot-admin``; never the owner)."""
+    if settings.db_app_password is None:
+        raise ValueError("FINBOT_DB_APP_PASSWORD_FILE is required to connect")
+    return ConnectionTarget(
+        host=settings.db_host,
+        port=settings.db_port,
+        database=settings.db_name,
+        user=settings.db_app_user,
+        password=settings.db_app_password,
+        application_name=application_name,
     )
 
 

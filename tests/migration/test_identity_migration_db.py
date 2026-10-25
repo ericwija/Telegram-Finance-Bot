@@ -32,12 +32,12 @@ def _functions(cluster: pg.ClusterInfo, database: str) -> set[str]:
     }
 
 
-def test_upgrade_to_head_adds_identity_tables_and_functions(
+def test_upgrade_to_0002_adds_identity_tables_and_functions(
     alembic_config: Config, pg_cluster: pg.ClusterInfo, test_database: str
 ) -> None:
     command.upgrade(alembic_config, "0001")
     baseline = _state(pg_cluster, test_database)
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "0002")
     state = _state(pg_cluster, test_database)
     assert state["version"] == ["0002"]
     assert state["tables"] == baseline["tables"] | IDENTITY_TABLES
@@ -55,10 +55,10 @@ def test_downgrade_to_0001_restores_the_baseline_exactly(
 ) -> None:
     command.upgrade(alembic_config, "0001")
     baseline = (_state(pg_cluster, test_database), _functions(pg_cluster, test_database))
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "0002")
     command.downgrade(_with_downgrade(alembic_config, migration_settings), "0001")
     assert (_state(pg_cluster, test_database), _functions(pg_cluster, test_database)) == baseline
-    command.upgrade(alembic_config, "head")
+    command.upgrade(alembic_config, "0002")
     assert _state(pg_cluster, test_database)["version"] == ["0002"]
 
 

@@ -22,6 +22,7 @@ dependencies = [
 [project.scripts]
 finbot = "finbot.__main__:main"
 finbot-migrate = "finbot.adapters.cli.migrate:main"  # owner-role entry point (decision S10)
+finbot-admin = "finbot.adapters.cli.admin:main"  # app-role platform-admin operations (Step 4B)
 
 [dependency-groups]
 dev = [

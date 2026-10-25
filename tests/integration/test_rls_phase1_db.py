@@ -507,12 +507,15 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "personal_membership_is_owner",
         "redeem_onboarding_invite",
         "resolve_principal",
+        "create_onboarding_invite",
+        "list_onboarding_invites",
+        "revoke_onboarding_invite",
     }
     for f in functions:
         assert f.owner == "finbot_owner"
         assert f.proconfig == ["search_path=pg_catalog, public"], f.proname
         assert "PUBLIC" not in f.executors, f.proname
-        assert f.returns in ("boolean", "trigger", "record", "uuid"), f.proname
+        assert f.returns in ("boolean", "trigger", "record", "uuid", "text"), f.proname
     executors = {f.proname: set(f.executors) - {"finbot_owner"} for f in functions}
     assert executors == {
         "app_is_active_member": {"finbot_app"},
@@ -520,6 +523,9 @@ async def test_AT_RLS_06_definer_functions_are_narrow(
         "personal_membership_is_owner": set(),
         "redeem_onboarding_invite": {"finbot_app"},
         "resolve_principal": {"finbot_app"},
+        "create_onboarding_invite": {"finbot_app"},
+        "list_onboarding_invites": {"finbot_app"},
+        "revoke_onboarding_invite": {"finbot_app"},
     }
 
 

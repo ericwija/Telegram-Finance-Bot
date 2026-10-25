@@ -13,6 +13,10 @@ Commands::
     finbot-migrate history                    list revisions (no connection)
     finbot-migrate sql upgrade|downgrade RANGE
                                               print guarded SQL offline (no connection, no password)
+    finbot-migrate bootstrap-admin --telegram-user-id ID --display-name NAME
+                                              ONE-TIME: create the first platform admin (Step 4B).
+                                              Not a migration: never run by upgrade, never at
+                                              start-up; refused once it has succeeded
 
 Exit codes: 0 success, 1 unexpected error, 2 invalid configuration, 3 refused by policy/guard.
 Output never contains secret values.
@@ -63,7 +67,25 @@ def _parser() -> argparse.ArgumentParser:
     sql = sub.add_parser("sql", help="print guarded SQL without connecting")
     sql.add_argument("direction", choices=("upgrade", "downgrade"))
     sql.add_argument("range", help="e.g. head, base:head, or 0002:0001 for a downgrade")
+    boot = sub.add_parser(
+        "bootstrap-admin",
+        help="one-time: create the first platform admin (operator only; not a migration)",
+    )
+    boot.add_argument(
+        "--telegram-user-id",
+        type=_telegram_user_id,
+        required=True,
+        metavar="ID",
+        help="numeric Telegram user ID of the operator who becomes the first platform admin",
+    )
+    boot.add_argument("--display-name", required=True, metavar="NAME")
     return parser
+
+
+def _telegram_user_id(value: str) -> int:
+    if not value.isdigit() or int(value) <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer Telegram user ID")
+    return int(value)
 
 
 def alembic_config(ini: Path, settings: MigrationSettings, out: TextIO) -> "Config":
@@ -137,8 +159,46 @@ def main(
         return EXIT_REFUSED
 
     configure_logging(settings.log_level, env=settings.env, stream=err)
+    if args.command == "bootstrap-admin":
+        return _bootstrap_admin(args, settings, out, err)
     logging.getLogger("alembic.runtime.plugins").setLevel(logging.WARNING)  # start-up noise
     return _execute(args, settings, out, err)
+
+
+def _bootstrap_admin(
+    args: argparse.Namespace, settings: MigrationSettings, out: TextIO, err: TextIO
+) -> int:
+    """Separate from the Alembic commands: one owner transaction, no schema change."""
+    import asyncio  # noqa: PLC0415
+
+    from finbot.infra.db.bootstrap import (  # noqa: PLC0415
+        BootstrapRefusedError,
+        bootstrap_platform_admin,
+    )
+    from finbot.infra.db.connection import create_engine, owner_target  # noqa: PLC0415
+
+    async def run() -> object:
+        engine = create_engine(owner_target(settings))
+        try:
+            return await bootstrap_platform_admin(
+                engine,
+                env=settings.env,
+                telegram_user_id=args.telegram_user_id,
+                display_name=args.display_name,
+            )
+        finally:
+            await engine.dispose()
+
+    try:
+        user_id = asyncio.run(run())
+    except BootstrapRefusedError as exc:
+        print(f"refused: {scrub(str(exc))}", file=err)
+        return EXIT_REFUSED
+    except Exception as exc:  # noqa: BLE001 - report every failure without a traceback
+        print(f"error: {type(exc).__name__}: {scrub(str(exc))}", file=err)
+        return EXIT_ERROR
+    print(f"platform admin bootstrapped: user {user_id} (this command cannot run again)", file=out)
+    return EXIT_OK
 
 
 def _execute(
