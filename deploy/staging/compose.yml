@@ -1,21 +1,29 @@
 # Telegram-Finance-Bot V2: STAGING compose project (D18). Runbook: deploy/staging/README.md
 #
-# Phase 1 Step 3A: the PostgreSQL service only. The migrate, bot and backup services are added
-# in later steps (doc 04 §8.1). Isolation from V1 and from the future production project:
+# Services (doc 04 §8.1):
+#   postgres  Step 3A. PostgreSQL 18.6, db network only.
+#   migrate   Step 5A. One-shot `finbot-migrate`, profile "ops": it never starts with `up`; the
+#             operator runs it explicitly (`run --rm migrate ...`, README §7, §8). Owner secret only.
+#   bot       Step 5A. `finbot bot`, exactly one replica (single-poller lock G-ENV-6), app
+#             secrets only, db + egress networks, heartbeat healthcheck.
+# The backup service follows in Phase 6. Isolation from V1 and from the future production project:
 #   project  finbot-staging            (V1: directory-named project, container "finance-bot")
 #   volume   finbot-staging_pgdata     (V1: "<project>_bot-data"; production: finbot-prod_pgdata)
 #   network  finbot-staging_db         (internal + gateway mode "isolated": no egress, no route
 #                                       to or from the host, never shared; 172.31.250.0/27)
+#   network  finbot-staging_egress     (bot only: outbound HTTPS to Telegram; 172.31.250.32/27)
 #   database finbot_staging            (guard G-ENV-2; production: finbot_prod)
+#   image    finbot-v2:staging         (built locally from deploy/docker/Dockerfile; never pulled)
 #
 # Rules enforced by tests/deploy/test_staging_compose.py (AT-DEP-01):
-#   * postgres has NO `ports:` / `expose:` and joins only the db network, so it is reachable
+#   * no service has `ports:` / `expose:`. postgres joins only the db network, so it is reachable
 #     only from containers on that network: never from the host, other projects or the internet.
-#     Future application containers (bot) join `db` AND a separate egress network for
-#     Telegram/Gemini; postgres never joins the egress network (doc 04 §8.1).
-#   * the image is pinned by version AND digest; a change is a reviewed PR (doc 04 §8.2).
+#     The bot joins `db` AND the egress network; postgres and migrate never join egress.
+#   * the postgres image is pinned by version AND digest; a change is a reviewed PR (doc 04
+#     §8.2). The app image is local (`pull_policy: never`) and built from a digest-pinned base.
 #   * secrets come only from git-ignored files in deploy/secrets/staging/ (no inline values,
-#     no variable interpolation, no .env file).
+#     no variable interpolation, no .env file). The owner password reaches only `migrate`;
+#     the bot gets only the app password and the Telegram token (S10).
 
 name: finbot-staging
 
@@ -137,6 +145,138 @@ services:
       org.finbot.environment: staging
       org.finbot.component: postgres
 
+
+  migrate:
+    # One-shot owner-role tool (S4, S10). `profiles` keeps it out of `up`/`down`; run it with
+    # `docker compose -f deploy/staging/compose.yml run --rm migrate <finbot-migrate args>`.
+    image: finbot-v2:staging
+    pull_policy: never
+    profiles:
+      - ops
+    user: "2997:2999" # gid 2999 reads the root:2999 0440 secret files (README §2)
+    restart: "no"
+    entrypoint:
+      - finbot-migrate
+    command:
+      - check-config
+    environment:
+      FINBOT_ENV: staging
+      FINBOT_LOG_LEVEL: INFO
+      FINBOT_DB_HOST: postgres
+      FINBOT_DB_PORT: "5432"
+      FINBOT_DB_NAME: finbot_staging
+      FINBOT_DB_OWNER_USER: finbot_owner
+      FINBOT_DB_OWNER_PASSWORD_FILE: /run/secrets/db_owner_password
+    secrets:
+      - db_owner_password
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - db
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 64
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    labels:
+      org.finbot.environment: staging
+      org.finbot.component: migrate
+
+  bot:
+    # Exactly one instance (G-ENV-6 refuses a second poller anyway). Never `--scale bot=N`.
+    image: finbot-v2:staging
+    pull_policy: never
+    container_name: finbot-staging-bot
+    user: "2998:2999" # gid 2999 reads the root:2999 0440 secret files (README §2)
+    init: true # tini as PID 1 forwards SIGTERM to finbot
+    restart: unless-stopped
+    stop_signal: SIGTERM # graceful: stop polling, finish handlers, release the lock
+    stop_grace_period: 75s
+    entrypoint:
+      - finbot
+    command:
+      - bot
+      - --health-file
+      - /run/finbot/heartbeat.json
+    environment:
+      FINBOT_ENV: staging
+      FINBOT_LOG_LEVEL: INFO
+      FINBOT_DEFAULT_TIMEZONE: Asia/Jakarta
+      FINBOT_DB_HOST: postgres
+      FINBOT_DB_PORT: "5432"
+      FINBOT_DB_NAME: finbot_staging
+      FINBOT_DB_APP_USER: finbot_app
+      FINBOT_DB_APP_PASSWORD_FILE: /run/secrets/db_app_password
+      FINBOT_TELEGRAM_TOKEN_FILE: /run/secrets/telegram_token
+      # Not a secret. Placeholder until the owner names the staging bot (README §2.3); with it,
+      # G-ENV-4 refuses to start, so the wrong token can never be served (fail closed).
+      FINBOT_TELEGRAM_EXPECTED_BOT_USERNAME: CHANGE_ME_staging_bot
+      FINBOT_AI_ENABLED: "false"
+      FINBOT_RECEIPTS_ENABLED: "false"
+      FINBOT_EXPORT_ENABLED: "false"
+      FINBOT_INVITES_ENABLED: "false"
+    secrets:
+      - db_app_password
+      - telegram_token
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # Fresh "ready" heartbeat = poller lock held and polling (doc 04 §5.8). Offline probe.
+      test:
+        - CMD
+        - finbot
+        - healthcheck
+        - --health-file
+        - /run/finbot/heartbeat.json
+        - --max-age
+        - "60"
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+      start_interval: 5s
+    networks:
+      - db
+      - egress
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+      - /run/finbot:size=1m,mode=1777
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    deploy:
+      replicas: 1
+      resources:
+        limits:
+          cpus: "0.5"
+          memory: 256M
+          pids: 128
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "5"
+    labels:
+      org.finbot.environment: staging
+      org.finbot.component: bot
+
 networks:
   db:
     name: finbot-staging_db
@@ -157,6 +297,19 @@ networks:
     labels:
       org.finbot.environment: staging
 
+  egress:
+    # The bot's only route out (Telegram Bot API over HTTPS). postgres and migrate never join.
+    name: finbot-staging_egress
+    driver: bridge
+    enable_ipv6: false
+    driver_opts:
+      com.docker.network.bridge.enable_icc: "false"
+    ipam:
+      config:
+        - subnet: 172.31.250.32/27
+    labels:
+      org.finbot.environment: staging
+
 volumes:
   pgdata:
     name: finbot-staging_pgdata
@@ -173,3 +326,5 @@ secrets:
     file: ../secrets/staging/db_app_password
   db_backup_password:
     file: ../secrets/staging/db_backup_password
+  telegram_token:
+    file: ../secrets/staging/telegram_token

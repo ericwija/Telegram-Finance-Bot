@@ -27,6 +27,8 @@ INIT_ROLES = ROOT / "deploy" / "postgres" / "initdb" / "00-roles.sh"
 SECRETS_DIR = ROOT / "deploy" / "secrets" / "staging"
 
 IMAGE_RE = re.compile(r"^postgres:18\.\d+-trixie@sha256:[0-9a-f]{64}$")
+#: The V2 application image: built locally from deploy/docker/Dockerfile, never pulled.
+APP_IMAGE = "finbot-v2:staging"
 PGDATA = "/var/lib/postgresql/18/docker"
 INIT_MARKER = "/var/lib/postgresql/18/finbot-init.done"
 DB_SUBNET = "172.31.250.0/27"
@@ -36,8 +38,6 @@ FORBIDDEN_NAMES = (
     # V1 (root docker-compose.yml / .env)
     "finance-bot",
     "bot-data",
-    "TELEGRAM_TOKEN",
-    "GEMINI_API_KEY",
     "GOOGLE_SHEETS",
     "SPREADSHEET_ID",
     "AUTHORIZED_USER_ID",
@@ -70,8 +70,14 @@ def test_AT_DEP_01_no_ports_expose_or_host_networking_in_raw_file() -> None:
 def test_AT_DEP_01_image_pinned_by_version_and_digest() -> None:
     images = re.findall(r"^\s*image:\s*(\S+)\s*$", _code(COMPOSE), re.M)
     assert images, "postgres image line not found"
-    for image in images:
+    pulled = [image for image in images if image != APP_IMAGE]
+    assert len(pulled) == 1, "only the postgres image is pulled from a registry"
+    for image in pulled:
         assert IMAGE_RE.fullmatch(image), image
+    # The local app image is never pulled (a registry image of that name cannot be substituted).
+    assert len(re.findall(r"^\s*pull_policy:\s*never\s*$", _code(COMPOSE), re.M)) == images.count(
+        APP_IMAGE
+    )
 
 
 def test_no_interpolation_env_files_or_inline_secrets() -> None:
@@ -92,6 +98,9 @@ def test_staging_names_are_isolated_from_v1_and_production() -> None:
     assert re.search(r"^name:\s*finbot-staging\s*$", code, re.M)
     for forbidden in FORBIDDEN_NAMES:
         assert forbidden not in code, forbidden
+    # V1's bare variable names; V2's FINBOT_TELEGRAM_TOKEN_FILE etc. are prefixed.
+    for v1_variable in ("TELEGRAM_TOKEN", "GEMINI_API_KEY"):
+        assert not re.search(rf"(?<![A-Z0-9_]){v1_variable}\b", code), v1_variable
     assert "/var/lib/postgresql/data" not in code, "PG 18 layout: mount /var/lib/postgresql"
     assert "../secrets/staging/" in text
     assert re.search(r"^\s*FINBOT_DB_NAME:\s*finbot_staging\s*$", code, re.M)
@@ -129,7 +138,8 @@ def _rendered() -> dict[str, Any]:
             pytest.fail("Docker CLI is required in CI for AT-DEP-01")
         pytest.skip("Docker CLI not available")
     result = subprocess.run(
-        [docker, "compose", "-f", str(COMPOSE), "config", "--format", "json"],
+        # --profile ops: also render the one-shot migrate service (never started by `up`).
+        [docker, "compose", "-f", str(COMPOSE), "--profile", "ops", "config", "--format", "json"],
         cwd=ROOT,
         check=False,
         capture_output=True,

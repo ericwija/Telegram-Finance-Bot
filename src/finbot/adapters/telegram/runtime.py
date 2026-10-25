@@ -8,7 +8,8 @@ wiring.
 A real run (Step 5, staging only, operated by ``deploy``) long-polls Telegram. Its lifecycle
 (:func:`serve`) is strictly ordered, and polling starts only after every guard passed:
 
-1. G-ENV-3: the database environment marker equals ``FINBOT_ENV``.
+1. G-ENV-2: the live connection's ``current_database()`` equals ``FINBOT_DB_NAME``; then
+   G-ENV-3: the database environment marker equals ``FINBOT_ENV``.
 2. G-ENV-6: the single-poller advisory lock is taken on a dedicated connection
    (:mod:`finbot.infra.db.poller_lock`). If another process holds it, the bot exits with
    "poller lock held" (AC-P1-04) without ever contacting Telegram.
@@ -302,7 +303,7 @@ def run_polling(
 
 
 async def _run(settings: Settings, token: str, health_file: Path | None, timings: Timings) -> None:
-    from finbot.infra.db.guards import require_environment_marker  # noqa: PLC0415
+    from finbot.infra.db.guards import check_database  # noqa: PLC0415
     from finbot.infra.db.poller_lock import PollerLock  # noqa: PLC0415
 
     engine = _engine(settings)
@@ -312,7 +313,9 @@ async def _run(settings: Settings, token: str, health_file: Path | None, timings
     try:
         await serve(
             build_application(token, _services(settings, engine)),
-            check_environment=lambda: require_environment_marker(engine, settings.env),
+            check_environment=lambda: check_database(
+                engine, env=settings.env, db_name=settings.db_name
+            ),
             acquire_lock=lambda: PollerLock.acquire(engine, settings.env),
             expected_username=settings.telegram_expected_bot_username,
             stop=stop,

@@ -14,7 +14,7 @@ from sqlalchemy import text
 
 from finbot.adapters.telegram.bot import BotServices, build_application
 from finbot.adapters.telegram.runtime import BotStartupError, PollerLockLostError, Timings, serve
-from finbot.infra.db.guards import require_environment_marker
+from finbot.infra.db.guards import check_database
 from finbot.infra.db.identity import PgIdentityGateway
 from finbot.infra.db.platform import PgPlatformGateway
 from finbot.infra.db.poller_lock import POLLER_LOCK_CLASS, PollerLock, PollerLockHeldError
@@ -117,7 +117,7 @@ async def test_lock_connection_is_not_left_in_a_transaction(
 
 
 class Poller:
-    def __init__(self, app_engine: Any, health: Path) -> None:
+    def __init__(self, app_engine: Any, health: Path, db_name: str) -> None:
         identities = PgIdentityGateway(app_engine)
         self.api = FakeBotApi()
         self.app = build_application(
@@ -129,13 +129,14 @@ class Poller:
             request=self.api,
         )
         self.engine = app_engine
+        self.db_name = db_name
         self.stop = asyncio.Event()
         self.health = health
 
     def serve(self) -> Any:
         return serve(
             self.app,
-            check_environment=lambda: require_environment_marker(self.engine, ENV),
+            check_environment=lambda: check_database(self.engine, env=ENV, db_name=self.db_name),
             acquire_lock=lambda: PollerLock.acquire(self.engine, ENV),
             expected_username=BOT_USERNAME,
             stop=self.stop,
@@ -150,13 +151,13 @@ class Poller:
 async def test_AC_P1_04_competing_pollers_loss_restart_and_shutdown(
     migrated_database: str, app_engine: Any, tmp_path: Path
 ) -> None:
-    a = Poller(app_engine, tmp_path / "a.json")
+    a = Poller(app_engine, tmp_path / "a.json", migrated_database)
     a_task = asyncio.create_task(a.serve())
     await eventually(a.polling)
     assert check_health(a.health).healthy
 
     # A second process is refused before it contacts Telegram.
-    b = Poller(app_engine, tmp_path / "b.json")
+    b = Poller(app_engine, tmp_path / "b.json", migrated_database)
     with pytest.raises(BotStartupError, match="poller lock held"):
         await b.serve()
     assert b.api.calls == []
@@ -175,7 +176,7 @@ async def test_AC_P1_04_competing_pollers_loss_restart_and_shutdown(
     assert check_health(a.health).reason == "bot state is failed"
 
     # Restart: a new process takes the lock and polls.
-    c = Poller(app_engine, tmp_path / "c.json")
+    c = Poller(app_engine, tmp_path / "c.json", migrated_database)
     c_task = asyncio.create_task(c.serve())
     await eventually(c.polling)
     assert len(await lock_holders(app_engine)) == 1
@@ -186,3 +187,14 @@ async def test_AC_P1_04_competing_pollers_loss_restart_and_shutdown(
     assert await lock_holders(app_engine) == []
     assert not c.app.running
     assert check_health(c.health).reason == f"bot state is {BotState.STOPPED}"
+
+
+async def test_G_ENV_2_wrong_database_refuses_before_the_lock_and_telegram(
+    migrated_database: str, app_engine: Any, tmp_path: Path
+) -> None:
+    poller = Poller(app_engine, tmp_path / "wrong.json", "finbot_staging")
+    with pytest.raises(BotStartupError, match="G-ENV-2"):
+        await poller.serve()
+    assert poller.api.calls == []
+    assert await lock_holders(app_engine) == []
+    assert check_health(poller.health).reason == "bot state is failed"

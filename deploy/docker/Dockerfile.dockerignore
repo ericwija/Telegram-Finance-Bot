@@ -1,0 +1,12 @@
+# Build context filter for deploy/docker/Dockerfile only (BuildKit: <Dockerfile>.dockerignore).
+# Allow-list: everything is excluded, then only what the V2 image needs is re-included.
+# V1 files, .env, deploy/secrets/, .git and local virtualenvs never enter the build context.
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!alembic.ini
+!migrations/
+!src/
+**/__pycache__
+**/*.pyc

@@ -105,7 +105,7 @@ Exit codes: `0` success, `1` unexpected error, `2` invalid configuration, `3` re
 
 ### 3.5 Staging and production (S4)
 
-The staging network is isolated (doc 04 §8.2), so nothing on the host can reach the database. Migrations run in a **dedicated one-shot `migrate` container** on `finbot-staging_db`, added in Step 5, with only the owner secret. The approved fallback is **offline SQL**: `finbot-migrate sql upgrade <range>` is reviewed, then applied by the `deploy` operator through `docker exec … psql -U finbot_owner -h 127.0.0.1 -d finbot_staging`, inside the container, with the password read from the mounted secret. Each use of the fallback needs explicit owner approval. Nothing in Step 3B.2 touches staging.
+The staging network is isolated (doc 04 §8.2), so nothing on the host can reach the database. Migrations run in a **dedicated one-shot `migrate` container** on `finbot-staging_db`, with only the owner secret (Step 5A: service `migrate` in `deploy/staging/compose.yml`, profile `ops`). They are **operator-controlled**: `up` never starts the service and the bot does not depend on it. The procedure (preflight, SQL review, mandatory backup, `upgrade 0003`, verification, restore instead of downgrade) is `deploy/staging/README.md` §7; the admin bootstrap is §8. The approved fallback is **offline SQL**: `finbot-migrate sql upgrade <range>` is reviewed, then applied by the `deploy` operator through `docker exec … psql -U finbot_owner -h 127.0.0.1 -d finbot_staging`, inside the container, with the password read from the mounted secret. Each use of the fallback needs explicit owner approval. Nothing in Step 3B.2 touches staging.
 
 ## 4. Database tests
 

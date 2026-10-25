@@ -16,7 +16,13 @@ import pytest_asyncio
 from finbot.adapters.telegram import messages_id as msg
 from finbot.adapters.telegram.bot import BotServices, build_application
 from finbot.infra.db.bootstrap import bootstrap_platform_admin
-from finbot.infra.db.guards import EnvironmentMismatchError, require_environment_marker
+from finbot.infra.db.guards import (
+    DatabaseNameMismatchError,
+    EnvironmentMismatchError,
+    check_database,
+    require_database_name,
+    require_environment_marker,
+)
 from finbot.infra.db.identity import PgIdentityGateway
 from finbot.infra.db.platform import PgPlatformGateway
 from finbot.services.onboarding import OnboardingService
@@ -142,3 +148,13 @@ async def test_environment_marker_guard(migrated_database: str, app_engine: Any)
     await require_environment_marker(app_engine, "test")
     with pytest.raises(EnvironmentMismatchError, match="G-ENV-3"):
         await require_environment_marker(app_engine, "production")
+
+
+async def test_G_ENV_2_live_database_name_guard(migrated_database: str, app_engine: Any) -> None:
+    await require_database_name(app_engine, migrated_database)
+    await check_database(app_engine, env="test", db_name=migrated_database)
+    for wrong in ("finbot_test", "finbot_staging", migrated_database.upper()):
+        with pytest.raises(DatabaseNameMismatchError, match="G-ENV-2"):
+            await check_database(app_engine, env="test", db_name=wrong)
+    with pytest.raises(EnvironmentMismatchError, match="G-ENV-3"):  # name right, marker wrong
+        await check_database(app_engine, env="staging", db_name=migrated_database)

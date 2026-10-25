@@ -5,7 +5,8 @@ Commands:
 * ``finbot check-config [--json]``: load and validate settings from the environment (local
   secret files included) and print a redacted summary. Exit codes: 0 valid, 2 invalid.
   It never connects to PostgreSQL, Telegram, Gemini or any other network service. The runtime
-  guards that need I/O (G-ENV-3 marker, G-ENV-6 poller lock, G-ENV-4 getMe) run in ``bot``.
+  guards that need I/O (G-ENV-2 live database name, G-ENV-3 marker, G-ENV-6 poller lock,
+  G-ENV-4 getMe) run in ``bot``.
 * ``finbot bot [--dry-run] [--health-file PATH]`` (Steps 4C/4D): run the Telegram bot by long
   polling until SIGTERM/SIGINT, or with ``--dry-run`` build it offline and describe it (no
   Telegram or database connection). Exit codes: 0 stopped cleanly, 2 invalid configuration,
